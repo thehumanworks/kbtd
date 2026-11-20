@@ -1,0 +1,8 @@
+[tools]
+python = "3.13"
+
+[env]
+_.path = ["./bin"]
+
+[tasks.test]
+run = "python -m unittest discover -s tests -v"

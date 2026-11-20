@@ -4,6 +4,28 @@ KBTD is a Python CLI and curses TUI for the TODO file format in [SPEC.md](SPEC.m
 
 ## Quick start
 
+### Run with mise
+
+With [mise](https://mise.jdx.dev/) on your PATH (Linux, macOS or WSL), run these in the directory where you want your board:
+
+```sh
+mise exec github:thehumanworks/kbtd -- kbtd init
+mise exec github:thehumanworks/kbtd -- kbtd        # open ./TODO.md in the TUI
+```
+
+The `github:` backend needs a [published release](https://github.com/thehumanworks/kbtd/releases) with the `kbtd.tar.gz` asset; it does not run the repository's main branch. The command after `--` is required. The launcher uses mise to install the Python build in the release's `mise.lock` on first use. No system Python, Nix or devenv is needed.
+
+From a checkout (also works before the first release):
+
+```sh
+mise trust                 # after reviewing mise.toml
+mise install --locked
+mise exec -- kbtd --help
+mise run test
+```
+
+### Run with Python
+
 With Python 3.13+ in this checkout:
 
 ```sh
@@ -93,6 +115,12 @@ The board shows columns side by side, with cards stacked inside them. A narrow t
 | `?` / `q` | Show shortcuts / quit |
 
 Edits replace the file atomically, then re-read it. The TUI checks for external changes every 250 ms. Changes reload the board and cancel pending input; if its H1 disappears, you return to the picker. There is no merge or locking: concurrent saves are last-write-wins. Only the selected section is remembered between sessions, keyed by the absolute Markdown path under `$XDG_STATE_HOME/kbtd` (default `~/.local/state/kbtd`).
+
+## Publishing a mise release
+
+`mise run package` builds `dist/kbtd.tar.gz` with the launcher, Python sources, `mise.toml` and `mise.lock`. Push a version tag such as `v0.1.0` to have [the release workflow](.github/workflows/release.yml) test and publish that archive. To run a specific published version, use e.g. `mise exec github:thehumanworks/kbtd@0.1.0 -- kbtd list`.
+
+To refresh the locked Python patch version, run `mise lock --bump python` and commit the updated `mise.lock`.
 
 ## Tests
 

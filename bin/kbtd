@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# Load the install's mise.lock, then return to the caller's directory so
+# relative paths (including ./TODO.md) still refer to the user's board.
+root=$(CDPATH= cd -P "$(dirname "$0")/.." && pwd)
+exec mise -C "$root" exec --locked python -- sh -ec '
+    export PYTHONPATH="$PWD"
+    cd "$1"
+    shift
+    exec python -P -m kbtd "$@"
+' kbtd "$PWD" "$@"
