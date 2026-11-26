@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .events import Event
 from .markdown import Document, parse_markdown
-from .watchers import Watchers
+from .watchers import SkippedWatchers, Watchers
 
 
 TEMPLATE = "# Tasks\n\n## Backlog\n\n## In Progress\n\n## Done\n"
@@ -74,6 +74,8 @@ class BoardFile:
         if events:
             try:
                 Watchers(self.path).emit_many(events)
+            except SkippedWatchers as e:
+                return replace(snapshot, watcher_warning=f"Board saved. {e}")
             except (OSError, RuntimeError, ValueError) as e:
                 return replace(snapshot, watcher_warning=f"Board saved. Watcher dispatch failed: {e}")
         return snapshot

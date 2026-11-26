@@ -1,5 +1,7 @@
 import json
 import os
+import random
+import re
 import shlex
 import signal
 import subprocess
@@ -13,20 +15,58 @@ from pathlib import Path
 from unittest.mock import patch
 
 from kbtd.conditions import compile_trigger
-from kbtd.watchers import MAX_RECOVERIES, Watchers
+from kbtd.watchers import MAX_RECOVERIES, SkippedWatchers, Watchers
 
 DEADLINE = 20  # seconds; each worker start imports and launches DBOS
 
 
-class TriggerTests(unittest.TestCase):
-    def test_deeply_grouped_condition_can_be_evaluated_after_registration(self):
-        expr = (r"task.completed \/ task.reopened /\ (" * 1000 + "owner.changed" + ")" * 1000)
-        self.assertTrue(compile_trigger(expr)(("task.reopened", "owner.changed"), {}))
+EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened")
+NAMES = ["codex", "Codex", "a b", 'q"x', "back\\slash", "ü", ""]
+COLUMNS = ["Backlog", "In Progress", 'Review "A" / B']
 
-    def test_boolean_operators_precedence_and_same_edit(self):
+
+def random_condition(rng, depth):
+    """A random condition as (Python source, reference evaluator)."""
+    if depth == 0 or rng.random() < 0.3:
+        match rng.randrange(6):
+            case 0:
+                event = rng.choice(EVENTS)
+                return event, lambda kinds, after, column: event in kinds
+            case 1:
+                field, name = rng.choice(["owners", "tags"]), rng.choice(NAMES)
+                op = rng.choice(["in", "not in"])
+                return (f"{json.dumps(name)} {op} task.{field}",
+                        lambda kinds, after, column: (name in after[field]) == (op == "in"))
+            case 2:
+                column, op = rng.choice(COLUMNS), rng.choice(["==", "!="])
+                return (f"task.status {op} {json.dumps(column)}",
+                        lambda kinds, after, column_now: (column_now == column) == (op == "=="))
+            case 3:
+                options = rng.sample(COLUMNS, 2)
+                return (f"task.status in {json.dumps(options)}",
+                        lambda kinds, after, column: column in options)
+            case 4:
+                return "task.done", lambda kinds, after, column: after["done"]
+            case _:
+                field = rng.choice(["owners", "tags"])
+                return f"task.{field}", lambda kinds, after, column: bool(after[field])
+    op = rng.choice(["and", "or", "not"])
+    if op == "not":
+        text, inner = random_condition(rng, depth - 1)
+        return f"not ({text})", lambda *args: not inner(*args)
+    (left_text, left), (right_text, right) = random_condition(rng, depth - 1), random_condition(rng, depth - 1)
+    space = rng.choice([" ", "  ", "\t"])
+    text = f"({left_text}){space}{op}{space}({right_text})"
+    if op == "and":
+        return text, lambda *args: left(*args) and right(*args)
+    return text, lambda *args: left(*args) or right(*args)
+
+
+class TriggerTests(unittest.TestCase):
+    def test_precedence_follows_python_and_reads_one_edit(self):
         payload = {"column": "In Progress", "after": {"owners": ["codex"], "tags": ["docs"]}}
-        expr = r'owner.changed = "codex" \/ tags.changed /\ ~task.status = "In Progress"'
-        grouped = r'(owner.changed = "codex" \/ tags.changed) /\ ~task.status = "In Progress"'
+        expr = 'owner.changed and "codex" in task.owners or tags.changed and not task.status == "In Progress"'
+        grouped = '(owner.changed or tags.changed) and task.status != "In Progress"'
         for owner in (False, True):
             for tags in (False, True):
                 kinds = tuple(name for name, present in (("owner.changed", owner), ("tags.changed", tags))
@@ -38,22 +78,68 @@ class TriggerTests(unittest.TestCase):
                                          owner or (tags and column != "In Progress"))
                         self.assertEqual(compile_trigger(grouped)(kinds, payload),
                                          (owner or tags) and column != "In Progress")
-                        self.assertEqual(compile_trigger(r'owner.changed /\ tags.changed')(kinds, payload),
+                        self.assertEqual(compile_trigger("owner.changed and tags.changed")(kinds, payload),
                                          owner and tags)
 
-    def test_value_predicates_use_typed_after_values_and_literal_column_names(self):
-        payload = {"column": 'Review "A" / B', "before": {"owners": ["codex"], "tags": ["old"]},
-                   "after": {"owners": ["Codex"], "tags": ["docs", "review"], "done": False}}
+    def test_fields_read_the_task_after_the_edit(self):
+        payload = {"section": "Tasks", "column": 'Review "A" / B', "before": {"owners": ["codex"]},
+                   "after": {"text": "Fix the bug @Codex", "owners": ["Codex"], "tags": ["docs", "review"],
+                             "done": False}}
+        kinds = ("owner.changed", "task.reopened")
         for expr, expected in [
-            ('owner.changed = "codex"', False), ('owner.changed = "Codex"', True),
-            ('tags.changed = "old"', False), ('tags.changed = "docs"', True),
-            ('tags.changed = "doc"', False), ('task.reopened = FALSE', True),
-            ('task.reopened = TRUE', False), ('task.completed = FALSE', False),
-            (r'task.status = "Review \"A\" / B"', True),
+            ('"codex" in task.owners', False), ('"Codex" in task.owners', True),
+            ('"doc" in task.tags', False), ('"docs" in task.tags and "review" in task.tags', True),
+            ("task.reopened and not task.done", True), ("task.completed", False),
+            ("task.status == 'Review \"A\" / B'", True), ('task.status in ["Backlog", "Ready"]', False),
+            ('task.section == "Tasks"', True), ('"bug" in task.text', True),
+            ("task.owners", True), ("not task.tags", False), ('task.tags == ["docs", "review"]', True),
+            ("task.owners == []", False),
         ]:
             with self.subTest(expr=expr):
-                self.assertEqual(compile_trigger(expr)(("owner.changed", "tags.changed", "task.reopened"),
-                                                       payload), expected)
+                self.assertEqual(compile_trigger(expr)(kinds, payload), expected)
+        self.assertFalse(compile_trigger('"codex" in task.owners or task.done')((), {}))
+
+    def test_matches_a_reference_evaluator_on_random_conditions(self):
+        rng = random.Random(20261126)
+        for _ in range(3000):
+            text, reference = random_condition(rng, rng.randrange(1, 6))
+            kinds = tuple(event for event in EVENTS if rng.random() < 0.5)
+            after = {"owners": rng.sample(NAMES, rng.randrange(3)), "tags": rng.sample(NAMES, rng.randrange(3)),
+                     "done": rng.random() < 0.5}
+            column = rng.choice(COLUMNS)
+            with self.subTest(text=text, kinds=kinds, after=after, column=column):
+                self.assertEqual(compile_trigger(text)(kinds, {"column": column, "after": after}),
+                                 reference(kinds, after, column))
+
+    def test_mistakes_are_rejected_with_a_reason(self):
+        for expr, reason in [
+            ("", "needs an event name"),
+            ('owner.changed = "codex"', "compare with =="),
+            (r"owner.changed /\ tags.changed", "use and, or, not"),
+            ("~owner.changed", "use 'not'"),
+            ('owner.changed and "codex"', "fixed value is not a condition"),
+            ('task.owners == "codex"', 'write "name" in task.owners'),
+            ('"a" == "a"', "two fixed values"),
+            ("True", "fixed value"),
+            ("task.status", "is a string, not a condition"),
+            ("task.owner", "did you mean 'task.owners'"),
+            ("TRUE", "write True or False"),
+            ("1", "only quoted strings"),
+            ('"a" < task.status', "only ==, !=, in and not in"),
+            ('task.status == "a" == "a"', "instead of chaining"),
+            ("task.owners in task.tags", "'in' needs a string on the left"),
+            ("task.status in [task.text]", "only contain quoted strings"),
+            ('__import__("os").system("id")', "Call expressions are not allowed"),
+            ("().__class__", "only event names and task fields"),
+            ("[x for x in task.tags]", "ListComp expressions"),
+            ("owner.changed\nand tags.changed", "wrap a trigger that spans lines in parentheses"),
+            ("not " * 100 + "owner.changed", "nested too deeply"),
+            ("(" * 300 + "owner.changed" + ")" * 300, "too many nested parentheses"),
+            ("owner.changed or " * 400 + "tags.changed", "at most 4096 characters"),
+        ]:
+            with self.subTest(expr=expr[:40]), self.assertRaisesRegex(ValueError, re.escape(reason)):
+                compile_trigger(expr)
+        self.assertTrue(compile_trigger("(owner.changed\n and tags.changed)")(("owner.changed", "tags.changed"), {}))
 
 
 class WatchersTests(unittest.TestCase):
@@ -100,7 +186,7 @@ class WatchersTests(unittest.TestCase):
         self.watchers.add("assign", "owner.changed", "exit 0")
         with self.assertRaisesRegex(ValueError, "already exists"):
             self.watchers.add("assign", "owner.changed", "exit 2")
-        with self.assertRaisesRegex(ValueError, "unknown watcher trigger"):
+        with self.assertRaisesRegex(ValueError, "unknown name 'unknown'"):
             self.watchers.add("invalid", "unknown", "exit 1")
         other = Watchers(self.board.with_name("other.md"))
         self.assertEqual(other.list(), [])
@@ -116,13 +202,22 @@ class WatchersTests(unittest.TestCase):
             self.watchers.remove("assign")
 
     def test_invalid_conditions_are_rejected_before_persisting(self):
-        for expr in ("", "task.status", 'task.status = TRUE', "owner.changed = codex", "()",
-                     'owner.changed = "broken', r'owner.changed = "bad\q"', "(owner.changed",
-                     "owner.changed /\\", "tags.changed)", "tags.changed unknown", "unknown",
-                     "task.completed = 1", "owner.changed == 'codex'", "owner.changed | tags.changed"):
+        for expr in ("", "task.status", "owner.changed = 'codex'", r"owner.changed /\ tags.changed", "()",
+                     'owner.changed and "broken', "(owner.changed", "owner.changed and", "tags.changed)",
+                     "tags.changed unknown", "unknown", "task.completed == 1", "owner.changed | tags.changed"):
             with self.subTest(expr=expr), self.assertRaises(ValueError):
                 self.watchers.add("invalid", expr, "exit 1")
             self.assertFalse(self.watchers.path.exists())
+
+    def test_an_invalid_stored_trigger_does_not_stop_other_watchers(self):
+        self.watchers.add("valid", "task.completed", "exit 0")
+        with self.watchers._database() as db:  # a definition from the earlier TLA+-style syntax
+            db.execute("INSERT INTO kbtd_watchers VALUES (?, ?, ?)",
+                       ("legacy", r'task.completed /\ task.status = "Done"', "exit 0"))
+        with patch.object(Watchers, "_start_worker"), \
+                self.assertRaisesRegex(SkippedWatchers, "Skipped watcher 'legacy'"):
+            self.watchers.emit("task.completed", {"column": "Done"})
+        self.assertEqual([(job["name"], job["status"]) for job in self.watchers.jobs()], [("valid", "queued")])
 
     def test_detached_action_receives_literal_event_and_uses_board_directory(self):
         # A worker that imported from the board directory would load this.

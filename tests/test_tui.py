@@ -93,7 +93,7 @@ class TuiTests(unittest.TestCase):
     def test_conditional_watcher_follows_tui_edits_across_columns(self):
         os.environ.pop("KBTD_JOB_ID", None)  # setUp isolates the environment
         watchers = Watchers(self.source.path)
-        condition = r'owner.changed = "codex" /\ tags.changed /\ task.status = "Queue"'
+        condition = 'owner.changed and "codex" in task.owners and tags.changed and task.status == "Queue"'
         watchers.add("combined", condition, "exit 0")
         self.enterContext(patch.object(Watchers, "_start_worker"))
         self.ui.select(0)
