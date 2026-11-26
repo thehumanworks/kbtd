@@ -1,6 +1,6 @@
 # KBTD — Markdown Kanban in the terminal
 
-KBTD is a Python CLI and curses TUI for Markdown task boards using [TODO.md](https://github.com/todo-md/todo-md) task syntax. Both interfaces edit the Markdown file itself. Optional watchers use a local SQLite queue to run your shell commands after board edits.
+KBTD is a Python CLI and curses TUI for Markdown task boards using [TODO.md](https://github.com/todo-md/todo-md) task syntax. Both interfaces edit the Markdown file itself. Optional watchers run your shell commands after board edits, as durable [DBOS](https://docs.dbos.dev/) workflows stored in a local SQLite file.
 
 ## Quick start
 
@@ -13,7 +13,7 @@ mise exec github:thehumanworks/kbtd -- kbtd init
 mise exec github:thehumanworks/kbtd -- kbtd        # open ./TODO.md in the TUI
 ```
 
-The `github:` backend needs a [published release](https://github.com/thehumanworks/kbtd/releases) with the `kbtd.tar.gz` asset; it does not run the repository's main branch. The command after `--` is required. The launcher uses mise to install the Python build in the release's `mise.lock` on first use. No system Python, Nix or devenv is needed.
+The `github:` backend needs a [published release](https://github.com/thehumanworks/kbtd/releases) with the `kbtd.tar.gz` asset; it does not run the repository's main branch. The command after `--` is required. On first use, the launcher installs the Python and uv builds pinned in the release's `mise.lock`. uv then installs the Python dependencies pinned in `uv.lock` into the install's `.venv`. No system Python, Nix or devenv is needed.
 
 From a checkout (also works before the first release):
 
@@ -34,7 +34,7 @@ python -m kbtd add Tasks Backlog "Write the RFC"
 python -m kbtd                          # choose a board and press Enter
 ```
 
-Or run `uv sync` and use `uv run kbtd` in place of `python -m kbtd`. Installing the project (`pip install .`) also provides the `kbtd` command. The CLI needs only the standard library. The TUI requires an interactive terminal and Python with curses (standard on most Unix builds; on Windows use WSL or install `windows-curses`).
+Or run `uv sync` and use `uv run kbtd` in place of `python -m kbtd`. Installing the project (`pip install .`) also provides the `kbtd` command. Board commands and the TUI need only the standard library. Watchers need the `dbos` package, which `uv sync` and `pip install .` install. The TUI requires an interactive terminal and Python with curses (standard on most Unix builds; on Windows use WSL or install `windows-curses`).
 
 ### Run with Nix or devenv
 
@@ -177,7 +177,7 @@ kbtd owner Tasks Backlog 1 alice
 kbtd watch jobs
 ```
 
-`watch jobs` shows the job ID, watcher, trigger, status, attempt and result. Once the job succeeds, `assignments.jsonl` contains a JSON event with the task path and the owners before and after the edit. The board command returns while the action runs in the background.
+`watch jobs` shows the job ID, watcher, trigger, status, attempt and result. Once the job succeeds, `assignments.jsonl` contains a JSON event with the task path and the owners before and after the edit. The board command returns at once. A background worker starts the action within about a second.
 
 | Trigger | When it fires on an existing task or subtask |
 | --- | --- |
@@ -200,16 +200,34 @@ For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KB
 
 Raw title edits can trigger owner and tag changes. Creating, moving or reordering a card, saving an unchanged value, and reloading an external edit produce no events. Watcher actions that call KBTD inherit a job ID that suppresses nested dispatch.
 
-Use `kbtd watch list` to see definitions, `kbtd watch remove NAME` to stop future matches, and `kbtd watch retry ID` to rerun a failed or interrupted job. A retry can repeat a shell side effect. The [watcher decision and event contract](docs/adr/0001-board-watchers.md) covers recovery, environment variables and the runner choice.
+Use `kbtd watch list` to see definitions and `kbtd watch remove NAME` to stop future matches.
+
+### Job history and recovery
+
+| Status | Meaning |
+| --- | --- |
+| `queued` | The edit recorded the job. It waits for the worker. |
+| `running` | The action started. After a reboot or a killed worker, the job shows `running` until the next worker reruns it. |
+| `succeeded` / `failed` | The command exited with code 0 / another code, or could not start. |
+| `interrupted` | The worker stopped during each of three starts. KBTD stops rerunning it. |
+| `cancelled` | Someone cancelled the job with the DBOS tools. |
+
+Actions run **at least once**. If the worker stops during an action, the next worker runs it again, up to three starts in total. Opening the TUI, listing jobs or an edit that matches a watcher starts that worker. `KBTD_ATTEMPT` tells the command which start this is. Use `KBTD_BOARD` and `KBTD_JOB_ID` together to deduplicate side effects.
+
+`kbtd watch show ID` prints one job as JSON: its command, event, exit code and the last 8 KiB of the command's combined output. `kbtd watch retry ID` reruns a failed, interrupted or cancelled job with its original command and event. A retry can repeat a shell side effect.
+
+Each board's watchers live in one SQLite file under `$XDG_STATE_HOME/kbtd/watchers` (default `~/.local/state/kbtd/watchers`). It is a standard DBOS system database, so the [DBOS CLI](https://docs.dbos.dev/python/reference/cli) can inspect it too, for example `uv run dbos workflow steps 3 -s sqlite:///PATH`. Worker diagnostics go to the `.log` file next to it. [ADR 0001](docs/adr/0001-board-watchers.md) defines triggers and the event contract. [ADR 0002](docs/adr/0002-dbos-watcher-runtime.md) explains the DBOS runtime and how it can move to Postgres.
 
 ## Publishing a mise release
 
-`mise run package` builds `dist/kbtd.tar.gz` with the launcher, Python sources, `mise.toml` and `mise.lock`. Push a version tag such as `v0.1.0` to have [the release workflow](.github/workflows/release.yml) test and publish that archive. To run a specific published version, use e.g. `mise exec github:thehumanworks/kbtd@0.1.0 -- kbtd list`.
+`mise run package` builds `dist/kbtd.tar.gz` with the launcher, Python sources, `mise.toml`, `mise.lock`, `pyproject.toml` and `uv.lock`. Push a version tag such as `v0.1.0` to have [the release workflow](.github/workflows/release.yml) test and publish that archive. To run a specific published version, use e.g. `mise exec github:thehumanworks/kbtd@0.1.0 -- kbtd list`.
 
 To refresh the locked Python patch version, run `mise lock --bump python` and commit the updated `mise.lock`.
 
 ## Tests
 
 ```sh
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v   # or: mise run test
 ```
+
+The watcher tests start real DBOS workers, so the suite takes about 25 seconds.

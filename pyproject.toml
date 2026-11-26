@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "A Markdown-backed Kanban CLI and terminal UI"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    # Durable execution for watcher actions; imported only by watcher commands and the worker.
+    "dbos>=3.7,<4",
+]
 
 [project.scripts]
 kbtd = "kbtd.cli:main"

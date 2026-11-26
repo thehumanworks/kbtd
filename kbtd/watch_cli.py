@@ -1,6 +1,7 @@
 """Register board-local shell actions and inspect their execution history."""
 
 import argparse
+import json
 from pathlib import Path
 
 from .conditions import EVENT_FIELDS
@@ -21,6 +22,8 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     remove = commands.add_parser("remove", parents=[common], help="remove a watcher")
     remove.add_argument("name")
     commands.add_parser("jobs", parents=[common], help="show job history and resume pending work")
+    show = commands.add_parser("show", parents=[common], help="print one job, its event and output, as JSON")
+    show.add_argument("id", type=int, help="job number from 'watch jobs'")
     retry = commands.add_parser("retry", parents=[common], help="rerun a failed or interrupted job")
     retry.add_argument("id", type=int, help="job number from 'watch jobs'")
 
@@ -49,6 +52,8 @@ def manage(path: Path, args: argparse.Namespace) -> None:
                 for job in jobs:
                     print(f"{job['id']}\t{job['name']}\t{job['trigger']}\t{job['status']}\t"
                           f"{job['attempt']}\t{job['detail'] or ''}")
+        case "show":
+            print(json.dumps(watchers.job(args.id), indent=2, ensure_ascii=False))
         case "retry":
             watchers.retry(args.id)
             print(f"Queued job {args.id} for retry")
