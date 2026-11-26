@@ -250,8 +250,11 @@ class CliTests(unittest.TestCase):
             "z-owner", "a-tags", "z-owner", "z-owner", "a-tags", "assign", "both", "either",
             "z-owner", "z-owner", "either",
         ])
-        with watchers._database() as db:
-            event = json.loads(db.execute("SELECT event FROM jobs WHERE name = 'both'").fetchone()[0])
+        [both] = [job for job in jobs if job["name"] == "both"]
+        shown = json.loads(self.cli("-f", path, "watch", "show", str(both["id"])))
+        self.assertEqual((shown["name"], shown["status"], shown["command"]), ("both", "queued", "exit 0"))
+        self.assertIn("no watcher job numbered 99", self.cli("-f", path, "watch", "show", "99", ok=False))
+        event = shown["event"]
         self.assertEqual((event["events"], event["trigger"], event["column"], event["path"]),
                          (["owner.changed", "tags.changed"], together, "Backlog", "1.1"))
         self.assertEqual(event["after"]["owners"], ["codex"])

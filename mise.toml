@@ -1,8 +1,10 @@
 [tools]
 python = "3.13"
+# Installs the locked Python dependencies (uv.lock) for the launcher and tests.
+uv = "0.13"
 
 [env]
 _.path = ["./bin"]
 
 [tasks.test]
-run = "python -m unittest discover -s tests -v"
+run = "uv run --frozen python -m unittest discover -s tests -v"
