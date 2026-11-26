@@ -24,7 +24,7 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     commands.add_parser("jobs", parents=[common], help="show job history and resume pending work")
     show = commands.add_parser("show", parents=[common], help="print one job, its event and output, as JSON")
     show.add_argument("id", type=int, help="job number from 'watch jobs'")
-    retry = commands.add_parser("retry", parents=[common], help="rerun a failed or interrupted job")
+    retry = commands.add_parser("retry", parents=[common], help="rerun a failed, interrupted or cancelled job")
     retry.add_argument("id", type=int, help="job number from 'watch jobs'")
     cancel = commands.add_parser("cancel", parents=[common], help="cancel a queued job before it starts")
     cancel.add_argument("id", type=int, help="job number from 'watch jobs'")
