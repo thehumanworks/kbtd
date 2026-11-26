@@ -1,6 +1,6 @@
 # KBTD — Markdown Kanban in the terminal
 
-KBTD is a Python CLI and curses TUI for the TODO file format in [SPEC.md](SPEC.md). Both interfaces edit the Markdown file itself. No database, browser or server is involved.
+KBTD is a Python CLI and curses TUI for Markdown task boards using [TODO.md](https://github.com/todo-md/todo-md) task syntax. Both interfaces edit the Markdown file itself. No database, browser or server is involved.
 
 ## Quick start
 
@@ -53,26 +53,37 @@ without needing an editable install of the CLI.
 
 ## File format
 
+Copy this board into `TODO.md` and open it with `kbtd`:
+
 ```markdown
-# Project Alpha
+# TODO
 
-## Backlog
+## Release
 
-- [ ] Write the RFC
-  Keep the example short.
+- [ ] Publish guide @alice #docs
+  Keep links relative.
+  - [ ] Review links
+- [ ] Publish FAQ
+  - [ ] Review links
 
-## In Progress
+## Ready
 
-- [x] Design mockups
+# DONE
 
-# Project Beta
-
-## Ideas
-
-- [ ] Try a new layout
+- [-] Retire the old guide
 ```
 
-Each H1 is a selectable board. Its H2s are columns; top-level `- [ ]` and `- [x]` items are cards. The checkbox state is independent of the column. Indented lines belong to the preceding card: they are **not** shown as cards but travel with it when moved (and are removed if it is deleted). Preambles, prose, blank lines and other non-board content stay in the file. Examples inside fenced code blocks are not boards or cards. Create or rename boards and columns by editing their headings in Markdown.
+Each H1 is a selectable board and each H2 under it a column. KBTD edits open (`- [ ]`) and done (`- [x]`) tasks in columns. Existing named boards still work. Tasks directly under an H1 and declined tasks (`- [-]`) are preserved, not displayed as cards. Declined does **not** mean blocked.
+
+| To edit by hand | What to write in `TODO.md` |
+| --- | --- |
+| Assign, change or remove an owner | Add, replace or remove one trailing `@USERNAME`, as in `Publish guide @alice #docs`. |
+| Mark or unmark as blocked | Add or remove the ordinary tag `#blocked`, e.g. `- [ ] Publish guide @alice #docs #blocked`. KBTD displays **BLOCKED**; other TODO.md clients see a tag. The checkbox is unchanged. |
+| Add, edit or delete a subtask | Add a checkbox line indented **two more spaces** than its parent. Edit its text in place. To delete, remove its line and attached subtree, not adjacent siblings. |
+
+Put editable metadata together at the end of the task line, separated by spaces or tabs. Token names use letters, digits, underscores and hyphens. KBTD does not edit mentions inside prose or URLs. The blocked tag is case-sensitive. If the trailing group contains multiple owners or duplicate blocked tags, resolve that field by editing the line rather than having KBTD choose for you.
+
+Other indented text is ordinary Markdown. It travels with its task and can be read with `i` or `kbtd show`. No typed description, due date or separate blocker-note syntax is defined. Preambles, fenced examples and unrelated prose stay in the file. Edit headings by hand to create or rename boards and columns.
 
 ## CLI
 
@@ -85,16 +96,27 @@ kbtd list [SECTION [COLUMN]]          List numbered sections, columns and cards
 kbtd add SECTION COLUMN TEXT          Append an unchecked card
 kbtd toggle SECTION COLUMN CARD       Toggle completion
 kbtd move SECTION COLUMN CARD TARGET  Append card to TARGET in the same section
-kbtd edit SECTION COLUMN CARD TEXT    Replace only the card text
-kbtd delete SECTION COLUMN CARD       Delete the card, including any nested notes
+kbtd edit SECTION COLUMN CARD TEXT    Replace task-line text, including any inline tokens
+kbtd subtask SECTION COLUMN CARD TEXT Append a child to CARD
+kbtd owner SECTION COLUMN CARD USER   Set or replace owner (or use --clear instead of USER)
+kbtd block SECTION COLUMN CARD        Add the #blocked tag
+kbtd unblock SECTION COLUMN CARD      Remove the #blocked tag
+kbtd show SECTION COLUMN CARD         Print the task and its attached Markdown
+kbtd delete SECTION COLUMN CARD       Delete the whole subtree and notes, without prompting
 ```
 
-Section and column selectors are exact names or **1-based numbers** in file order. Numeric selectors always mean positions. For duplicate names, use the numbers from `list`. Card numbers are local to their column, **not** persistent IDs. Quote names and text that contain spaces.
+Section and column selectors are exact names or **1-based numbers** in file order. Numeric selectors always mean positions. For duplicate names, use the numbers from `list`. Card paths are 1-based positions local to the column, **not** persistent IDs: `2` is the second root, `2.1` its first child. Children do not change root numbers. Use `list` again after adding, moving or deleting tasks. Quote names and text that contain spaces.
 
 ```sh
-kbtd -f notes.md list
-kbtd -f notes.md move 'Project Alpha' Backlog 1 'In Progress'
-kbtd -f notes.md toggle 1 2 1
+# For the Release column in the example above:
+kbtd owner TODO Release 1 bob
+kbtd block TODO Release 1
+kbtd subtask TODO Release 1 "Check screenshots"
+kbtd edit TODO Release 2.1 "Review FAQ links"
+kbtd show TODO Release 1
+kbtd unblock TODO Release 1
+kbtd owner TODO Release 1 --clear
+kbtd delete TODO Release 1.2
 ```
 
 ## TUI
@@ -107,10 +129,14 @@ The board shows columns side by side, with cards stacked inside them. A narrow t
 | Enter | Open the selected board, or toggle the selected card |
 | ←/→ or `h`/`l` | Focus a column |
 | Space / click card | Toggle completion |
-| `H`/`L` or `<`/`>` | Move card to the previous/next column |
-| Drag card to another column | Append it to that column (mouse-capable terminals) |
+| `H`/`L` or `<`/`>` | Move a root task and its subtree to the previous/next column |
+| Drag card to another column | Append the root and its subtree to that column (mouse-capable terminals) |
 | `a` / `e` | Add a card / edit its text; Enter saves, Esc cancels |
-| `d` | Delete selected card and notes after confirmation |
+| `s` | Add a child to the selected task; Enter saves, Esc cancels |
+| `o` | Edit the owner; save an empty value to clear |
+| `B` | Mark or unmark the selected task as blocked |
+| `i` | Inspect the selected Markdown subtree, including notes; ↑/↓ scroll, Esc returns |
+| `d` | Delete selected task, its descendants and notes after confirmation |
 | `b` / Esc / click `[Boards]` | Return to the section picker |
 | `?` / `q` | Show shortcuts / quit |
 

@@ -91,3 +91,41 @@ class CliTests(unittest.TestCase):
         self.assertEqual(after.document, doc)
         self.assertNotEqual(before.version, after.version)
         self.assertEqual(stat.S_IMODE(self.file.stat().st_mode), 0o640)
+
+    def test_task_paths_and_fields_in_headless_cli(self):
+        self.file.write_bytes(b"# TODO\r\n## Release\r\n- [ ] A\r\n  - [ ] Same\r\n"
+                              b"- [x] B #docs\r\n  - [ ] Same\r\n    URL\r\n# DONE\r\n- [-] no")
+        path = str(self.file)
+
+        def run(cmd, *args):
+            return self.cli("-f", path, cmd, "TODO", "Release", *args)
+
+        run("owner", "2.1", "alice")
+        self.assertIn("Same @alice", run("show", "2.1"))
+        run("owner", "2.1", "bob")
+        run("block", "2.1")
+        self.assertEqual(run("show", "2.1"), "  - [ ] Same @bob #blocked\r\n    URL\r\n")
+        run("owner", "2.1", "--clear")
+        run("unblock", "2.1")
+        run("edit", "2.1", "FAQ")
+        run("toggle", "2.1")
+        run("subtask", "2", "Another")
+        run("subtask", "2.1", "Deep")
+        self.assertIn("2.1.1. [ ] Deep", run("list"))
+        self.assertIn("2.2. [ ] Another", run("list"))
+        run("delete", "2.1")
+        self.assertEqual(self.file.read_bytes(), b"# TODO\r\n## Release\r\n- [ ] A\r\n  - [ ] Same\r\n"
+                         b"- [x] B #docs\r\n  - [ ] Another\r\n# DONE\r\n- [-] no")
+
+    def test_ambiguous_metadata_bad_owners_and_paths_never_save(self):
+        original = b"# TODO\n## C\n- [ ] T @a @b #blocked #blocked\n  - [ ] S"
+        self.file.write_bytes(original)
+        for cmd, path, args in [
+            ("owner", "1", ["--clear"]), ("owner", "1.1", ["two words"]), ("owner", "1.1", ["@@x"]),
+            ("block", "1", []), ("unblock", "1", []), ("move", "1.1", ["C"]),
+            ("subtask", "1.2", ["wrong"]), ("delete", "1.0", []), ("toggle", "1..1", []),
+        ]:
+            with self.subTest(cmd=cmd, path=path, args=args):
+                with patch.object(BoardFile, "save", side_effect=AssertionError("unexpected write")):
+                    self.assertTrue(self.cli("-f", str(self.file), cmd, "1", "1", path, *args, ok=False))
+                self.assertEqual(self.file.read_bytes(), original)

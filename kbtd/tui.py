@@ -25,6 +25,7 @@ class BoardUI:
         self.pick = self.col = self.row = 0
         self.mode = "browse"
         self.draft = ""
+        self.detail_scroll = 0
         self.caret = 0
         self.drag: tuple[int, int] | None = None
         self.notice = ""
@@ -47,7 +48,7 @@ class BoardUI:
     @property
     def card(self) -> Card | None:
         column = self.column
-        return column.cards[self.row] if column and column.cards else None
+        return column.rows[self.row][1] if column and column.rows else None
 
     def _key(self) -> SectionKey | None:
         if self.section is None:
@@ -61,7 +62,7 @@ class BoardUI:
         board = self.board
         self.col = _clamp(self.col, len(board.columns) if board else 0)
         column = self.column
-        self.row = _clamp(self.row, len(column.cards) if column else 0)
+        self.row = _clamp(self.row, len(column.rows) if column else 0)
 
     def _install(self, snapshot: Snapshot, key: SectionKey | None) -> None:
         self.snapshot = snapshot
@@ -100,6 +101,9 @@ class BoardUI:
         return True
 
     def _save(self, document: Document) -> bool:
+        if document is self.doc:
+            self.mode, self.notice = "browse", "Unchanged"
+            return True
         try:
             self._install(self.source.save(document), self._key())
         except (OSError, UnicodeError) as e:
@@ -112,10 +116,13 @@ class BoardUI:
         board = self.board
         if board is None or not 0 <= dest < len(board.columns) or dest == source:
             return
-        card = board.columns[source].cards[row]
+        _, card = board.columns[source].rows[row]
+        if card.indent:
+            self.notice = "Move the top-level task to move its subtree"
+            return
         target = board.columns[dest]
         if self._save(self.doc.move(card, target)):
-            self.col, self.row = dest, len(target.cards)
+            self.col, self.row = dest, len(target.rows)
             self._fit()
 
     def _input(self, key: str | int) -> None:
@@ -126,8 +133,14 @@ class BoardUI:
             try:
                 if self.mode == "add" and column:
                     if self._save(self.doc.add(column, self.draft)):
-                        self.row = len(column.cards)
+                        self.row = len(column.rows)
                         self._fit()
+                elif self.mode == "subtask" and card:
+                    if self._save(self.doc.add_child(card, self.draft)) and self.column:
+                        self.row = next((i for i, (_, child) in enumerate(self.column.rows)
+                                         if child.start == card.end), self.row)
+                elif self.mode == "owner" and card:
+                    self._save(self.doc.set_owner(card, self.draft or None))
                 elif card:
                     self._save(self.doc.edit(card, self.draft))
             except ValueError as e:
@@ -155,10 +168,15 @@ class BoardUI:
         self.notice = ""
         if key == curses.KEY_RESIZE:
             return True
-        if self.mode in ("add", "edit"):
+        if self.mode in ("add", "edit", "subtask", "owner"):
             self._input(key)
         elif key == "q":
             return False
+        elif self.mode == "detail":
+            if key in UP + DOWN:
+                self.detail_scroll = max(0, self.detail_scroll + (1 if key in DOWN else -1))
+            else:
+                self.mode = "browse"
         elif self.mode == "help":
             self.mode = "browse"
         elif self.mode == "delete":
@@ -189,6 +207,20 @@ class BoardUI:
                 self._save(self.doc.toggle(card))
             elif key in ("H", "<", "L", ">"):
                 self._move(self.col, self.row, self.col + (1 if key in ("L", ">") else -1))
+            elif key == "s":
+                self.mode, self.draft, self.caret = "subtask", "", 0
+            elif key == "i":
+                self.mode, self.detail_scroll = "detail", 0
+            elif key in ("o", "B"):
+                try:
+                    if key == "B":
+                        self._save(self.doc.set_blocked(card, not card.blocked))
+                    else:
+                        owner = card.field("owner")
+                        self.draft = owner[0][1:] if owner else ""
+                        self.mode, self.caret = "owner", len(self.draft)
+                except ValueError as e:
+                    self.notice = str(e)
             elif key == "e":
                 self.mode, self.draft, self.caret = "edit", card.text, len(card.text)
             elif key == "d":

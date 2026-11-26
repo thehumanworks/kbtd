@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from kbtd.cli import main
 from kbtd.storage import BoardFile, SelectionStore
 
 try:
@@ -172,3 +173,86 @@ class TuiTests(unittest.TestCase):
         ui.poll()
         self.view.draw(ui)
         self.assertIn("No boards", self.screen.entries[3, 0][0])
+
+    def test_readme_board_owner_block_hierarchy_and_delete_across_interfaces(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        example = readme.split("## File format\n", 1)[1].split("```markdown\n", 1)[1].split("```", 1)[0]
+        self.source.path.write_text(example)
+        ui = self.open()
+        ui.key("\n")
+        ui.key("o")
+        self.assertEqual(ui.draft, "alice")
+        for _ in "alice":
+            ui.key(curses.KEY_BACKSPACE)
+        for char in "bob\n":
+            ui.key(char)
+        self.assertEqual(self.source.path.read_text(), example.replace("@alice", "@bob"))
+        ui.key("B")
+        self.view.draw(ui)
+        self.assertIn("BLOCKED", self.screen.entries[3, 0][0])
+        self.assertTrue(self.screen.entries[3, 0][1] & curses.A_BOLD)
+        child_y = next(y for (y, x), (text, _) in self.screen.entries.items() if x == 0 and "↳" in text)
+        self.assertEqual(self.view.card_at(3, child_y), (0, 1))
+        ui.key("i")
+        self.view.draw(ui)
+        self.assertTrue(any("Keep links relative" in s for s, _ in self.screen.entries.values()))
+        ui.key("\x1b")
+        ui.key("B")
+        ui.key("o")
+        for _ in "bob":
+            ui.key(curses.KEY_BACKSPACE)
+        ui.key("\n")
+        ui.key("o")
+        for ch in "amy\n":
+            ui.key(ch)
+        self.assertEqual(self.source.path.read_text(), example.replace("@alice #docs", "#docs @amy"))
+
+        ui.key("s")
+        for ch in "Screenshots\n":
+            ui.key(ch)
+        self.assertEqual(ui.card.text, "Screenshots")
+        self.assertEqual(ui.column.rows[ui.row][0], "1.2")
+        ui.key("e")
+        ui.key("!")
+        ui.key("\n")
+        self.assertEqual(ui.card.text, "Screenshots!")
+        ui.key("d")
+        ui.key("y")
+        self.assertNotIn("Screenshots", self.source.path.read_text())
+
+        self.assertEqual(main(["-f", str(self.source.path), "edit", "TODO", "Release", "2.1", "FAQ links"]), 0)
+        self.assertTrue(ui.poll())
+        ui.select(0)
+        ui.key("d")
+        self.view.draw(ui)
+        self.assertIn("subtree", self.screen.entries[16, 0][0])
+        before = self.source.path.read_bytes()
+        with patch.object(self.source, "save", side_effect=AssertionError("cancel must not save")):
+            ui.key("n")
+        self.assertEqual(self.source.path.read_bytes(), before)
+        ui.key("d")
+        ui.key("y")
+        self.assertEqual(self.source.path.read_text(), example[:example.index("- [ ] Publish guide")]
+                         + example[example.index("- [ ] Publish FAQ"):].replace("Review links", "FAQ links"))
+
+    def test_new_actions_cancel_on_reload_and_moves_preserve_the_subtree(self):
+        self.source.path.write_text("# TODO\n## A\n- [ ] Parent\n  - [x] Kid\n## B\n- [ ] Other\n  - [ ] Kid\n")
+        ui = self.open()
+        ui.select(0)
+        ui.key("j")
+        ui.key("L")
+        self.assertIn("top-level", ui.notice)
+        self.assertEqual((ui.column.name, ui.card.text), ("A", "Kid"))
+        ui.key("k")
+        ui.key("L")
+        self.assertEqual((ui.column.name, ui.row, ui.card.text), ("B", 2, "Parent"))
+        self.assertEqual(ui.column.rows[-1][0], "2.1")
+        self.assertTrue(ui.column.rows[-1][1].done)
+        for key, mode in [("o", "owner"), ("s", "subtask"), ("d", "delete")]:
+            ui.key(key)
+            self.assertEqual(ui.mode, mode)
+            updated = self.source.path.read_text().replace("Parent", "Parent!")
+            self.source.path.write_text(updated)
+            self.assertTrue(ui.poll())
+            self.assertEqual(ui.mode, "browse")
+            self.assertEqual(self.source.path.read_text(), updated)

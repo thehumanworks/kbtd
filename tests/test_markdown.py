@@ -75,3 +75,49 @@ class MarkdownTests(unittest.TestCase):
                     doc.add(col, text)
                 with self.assertRaises(ValueError):
                     doc.edit(col.cards[0], text)
+
+    def test_child_ranges_preserve_parent_notes_fences_and_declined_tasks(self):
+        head = "\ufeff# TODO\r\n## A\r\n- [ ] Root\r\n"
+        leaf = "    - [ ] leaf\r\n      leaf note  \r\n"
+        child = "  - [ ] one\r\n    child note\r\n" + leaf
+        rest = ("\r\n  parent's note\r\n   ~~~md\r\n  - [ ] example, not a child\r\n"
+                "   ~~~\r\n  - [-] declined\r\n    - [ ] ignored\r\n  - [ ] two\r\n")
+        tail = "\r\nloose prose\r\n## B\r\n- [ ] other"
+        doc = parse_markdown(head + child + rest + tail)
+        a, b = doc.sections[0].columns
+        self.assertEqual([(path, c.text) for path, c in a.rows],
+                         [("1", "Root"), ("1.1", "one"), ("1.1.1", "leaf"), ("1.2", "two")])
+        self.assertEqual(doc.delete(a.resolve("1.1")).serialize(), head + rest + tail)
+        self.assertEqual(doc.delete(a.resolve("1.1.1")).serialize(), doc.serialize().replace(leaf, ""))
+        self.assertEqual(doc.edit(a.resolve("1.2"), "three").serialize(),
+                         doc.serialize().replace("] two", "] three"))
+        moved = doc.move(a.resolve("1"), b)
+        self.assertEqual(moved.serialize(), head[:head.index("- [ ]")] + tail + "\r\n"
+                         + head[head.index("- [ ]"):] + child + rest.rstrip("\r\n"))
+        with self.assertRaisesRegex(ValueError, "top-level"):
+            doc.move(a.resolve("1.1"), b)
+
+    def test_unclosed_fenced_note_cannot_swallow_new_child(self):
+        doc = parse_markdown("# TODO\n## B\n- [ ] Parent\n  ```md\n  - [ ] example\n")
+        parent = doc.sections[0].columns[0].resolve("1")
+        self.assertEqual(parent.children, ())
+        with self.assertRaisesRegex(ValueError, "fenced note"):
+            doc.add_child(parent, "not really a task")
+
+    def test_metadata_edits_touch_only_one_suffix_token(self):
+        line = "- [x] Ask @jo about a@b.co and https://docs/#blocked #keep\t@ada  #ops  "
+        doc = parse_markdown("# TODO\r\n## Here\r\n" + line + "\r\n  note @ada #blocked")
+        task = doc.sections[0].columns[0].resolve("1")
+        self.assertFalse(task.blocked)
+        self.assertEqual(doc.set_owner(task, "@bob").serialize(),
+                         doc.serialize().replace("#keep\t@ada", "#keep\t@bob"))
+        self.assertEqual(doc.set_owner(task, None).serialize(),
+                         doc.serialize().replace("\t@ada", ""))
+        self.assertIs(doc.set_blocked(task, False), doc)
+        flagged = doc.set_blocked(task, True)
+        task = flagged.sections[0].columns[0].resolve("1")
+        self.assertTrue(task.blocked)
+        self.assertTrue(task.done)
+        self.assertEqual(flagged.serialize(), doc.serialize().replace("#ops  ", "#ops #blocked  "))
+        self.assertIs(flagged.set_blocked(task, True), flagged)
+        self.assertEqual(flagged.set_blocked(task, False).serialize(), doc.serialize())

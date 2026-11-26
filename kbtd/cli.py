@@ -13,10 +13,15 @@ COMMANDS = {
     "init": "create a starter board; never overwrite a file",
     "list": "list boards, columns and numbered cards",
     "add": "append an unchecked card",
+    "subtask": "append an unchecked child to the selected task",
+    "show": "print the selected task and its attached Markdown",
+    "owner": "set the task owner, or remove it with --clear",
+    "block": "mark a task with the #blocked tag",
+    "unblock": "remove the #blocked tag",
     "toggle": "toggle a card's checkbox",
-    "move": "append a card and its notes to another column",
-    "edit": "change a card's text, keeping its notes",
-    "delete": "remove a card and its indented notes",
+    "move": "append a root task and its whole subtree to another column",
+    "edit": "replace task-line text including inline tags/owner; keep children and notes",
+    "delete": "delete this task, all its descendants and attached notes (no prompt)",
 }
 
 
@@ -38,10 +43,14 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("section", nargs=nargs, help="section name or 1-based number")
         sub.add_argument("column", nargs=nargs, help="column name or 1-based number")
         if command not in ("list", "add"):
-            sub.add_argument("card", type=int, help="1-based card number in the source column")
+            sub.add_argument("card", help="1-based task path within the column, e.g. 2 or 2.1")
         if command == "move":
             sub.add_argument("target", help="destination column name or number in the same section")
-        if command in ("add", "edit"):
+        if command == "owner":
+            who = sub.add_mutually_exclusive_group(required=True)
+            who.add_argument("username", nargs="?", help="username with or without @")
+            who.add_argument("--clear", action="store_true", help="remove the owner")
+        if command in ("add", "edit", "subtask"):
             sub.add_argument("text", help="one line of task text (quote spaces)")
     return parser
 
@@ -71,19 +80,27 @@ def _listing(doc: Document, section: str | None, column: str | None) -> None:
         for c in lanes:
             lane = board.columns[c]
             print(f"  ## {c + 1}. {lane.name}")
-            for n, card in enumerate(lane.cards, 1):
-                print(f"     {n}. [{'x' if card.done else ' '}] {card.text}")
+            for path, card in lane.rows:
+                print(f"     {' ' * card.indent}{path}. [{'x' if card.done else ' '}] {card.text}")
+
+
+def _column(doc: Document, args: argparse.Namespace) -> Column:
+    board = doc.sections[_index(doc.sections, args.section, "section")]
+    return board.columns[_index(board.columns, args.column, "column")]
 
 
 def _change(doc: Document, args: argparse.Namespace) -> Document:
-    board = doc.sections[_index(doc.sections, args.section, "section")]
-    column = board.columns[_index(board.columns, args.column, "column")]
+    column = _column(doc, args)
     if args.command == "add":
         return doc.add(column, args.text)
-    if not 1 <= args.card <= len(column.cards):
-        raise ValueError(f"no card numbered {args.card} in {column.name!r}")
-    card = column.cards[args.card - 1]
+    card = column.resolve(args.card)
     match args.command:
+        case "subtask":
+            return doc.add_child(card, args.text)
+        case "owner":
+            return doc.set_owner(card, args.username)
+        case "block" | "unblock":
+            return doc.set_blocked(card, args.command == "block")
         case "edit":
             return doc.edit(card, args.text)
         case "delete":
@@ -91,6 +108,7 @@ def _change(doc: Document, args: argparse.Namespace) -> Document:
         case "toggle":
             return doc.toggle(card)
         case "move":
+            board = doc.sections[_index(doc.sections, args.section, "section")]
             return doc.move(card, board.columns[_index(board.columns, args.target, "column")])
         case _:
             raise AssertionError(args.command)
@@ -124,6 +142,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_tui(source, snapshot)
         elif args.command == "list":
             _listing(snapshot.document, args.section, args.column)
+        elif args.command == "show":
+            doc = snapshot.document
+            card = _column(doc, args).resolve(args.card)
+            sys.stdout.write("".join(doc.lines[card.start:card.end]))
         else:
             changed = _change(snapshot.document, args)
             if changed is not snapshot.document:

@@ -76,8 +76,14 @@ class View:
     def _cards(self, column: Column, index: int, x: int, width: int, focus: int | None) -> None:
         capacity = self.height - 5
 
+        def margin(i: int) -> str:
+            indent = min(column.rows[i][1].indent, width - 7)
+            return (" " * (indent - 1) + "↳") if indent else ""
+
         def wrap(i: int) -> list[str]:
-            return textwrap.wrap(column.cards[i].text, width=max(1, width - 5),
+            card = column.rows[i][1]
+            label = ("BLOCKED · " if card.blocked else "") + card.text
+            return textwrap.wrap(label, width=max(1, width - 5 - len(margin(i))),
                                  max_lines=min(3, capacity), placeholder="…") or [""]
 
         # Scroll by whole cards, keeping all the focused card's rows on screen.
@@ -91,14 +97,17 @@ class View:
                 room -= n
                 first -= 1
         y = 3
-        for i in range(first, len(column.cards)):
-            card = column.cards[i]
+        for i in range(first, len(column.rows)):
+            _, card = column.rows[i]
             attr = curses.A_DIM if card.done else curses.A_NORMAL
+            if card.blocked:
+                attr |= curses.A_BOLD
             if i == focus:
                 attr |= curses.A_REVERSE
             for j, line in enumerate(wrap(i)):
                 prefix = "     " if j else (" [x] " if card.done else " [ ] ")
-                self._put(y, x, prefix + line, attr, width, pad=i == focus)
+                self._put(y, x, ((" " * len(margin(i))) if j else margin(i)) + prefix + line,
+                          attr, width, pad=i == focus)
                 self.rows[index, y] = i
                 y += 1
                 if y >= self.height - 2:
@@ -127,18 +136,35 @@ class View:
             self._put(2, left, f" {i + 1}. {column.name} ({len(column.cards)})", attr, right - left, pad=True)
             self._cards(column, i, left, right - left, ui.row if i == ui.col else None)
 
+    def _detail(self, ui: BoardUI) -> None:
+        card = ui.card
+        assert card is not None
+        self._put(2, 0, "Task in TODO.md", curses.A_BOLD)
+        lines = []
+        for line in ui.doc.lines[card.start:card.end]:
+            lines.extend(textwrap.wrap(line.rstrip("\r\n"), width=self.width,
+                                       drop_whitespace=False) or [""])
+        capacity = self.height - 5
+        ui.detail_scroll = min(ui.detail_scroll, max(0, len(lines) - capacity))
+        for y, line in enumerate(lines[ui.detail_scroll:ui.detail_scroll + capacity], 3):
+            self._put(y, 0, line)
+
     def _footer(self, ui: BoardUI) -> None:
         status = ui.notice
-        if ui.mode in ("add", "edit"):
-            label = "New card: " if ui.mode == "add" else "Edit: "
+        if ui.mode in ("add", "edit", "subtask", "owner"):
+            label = {"add": "New card: ", "edit": "Edit: ", "subtask": "New child: ",
+                     "owner": "Owner: "}[ui.mode]
             # Keep the insertion point visible when editing a long line.
             before = _clip(ui.draft[:ui.caret][::-1], self.width - len(label) - 2)[::-1]
             self._put(self.height - 2, 0, label + before + "▏" + ui.draft[ui.caret:], curses.A_BOLD)
             hints = status or "Enter: save   Esc: cancel   ←/→: edit"
         else:
             if ui.mode == "delete":
-                status = "Delete this card AND its indented notes? (y/N)"
+                status = ("Delete subtree AND notes? (y/N)" if ui.card and ui.card.children
+                          else "Delete task, subtasks and notes? (y/N)")
                 hints = "y: delete   any other key: cancel"
+            elif ui.mode == "detail":
+                hints = "↑/↓: scroll   Esc: back   q: quit"
             elif ui.mode == "help":
                 hints = "Press any key to return   q: quit"
             elif ui.section is None or ui.read_error:
@@ -147,7 +173,7 @@ class View:
                 if not status and ui.column and ui.board:
                     status = f"Column {ui.col + 1}/{len(ui.board.columns)} · {ui.column.name}"
                     if ui.card:
-                        status += f" · Card {ui.row + 1}/{len(ui.column.cards)}: {ui.card.text}"
+                        status += f" · Task {ui.column.rows[ui.row][0]}: {ui.card.text}"
                 hints = "?: help   q: quit   b: boards   arrows: focus   Space: toggle   H/L: move   a/e/d: add/edit/delete"
             self._put(self.height - 2, 0, status, curses.A_BOLD)
         self._put(self.height - 1, 0, hints, curses.A_REVERSE, pad=True)
@@ -170,10 +196,14 @@ class View:
                     "←/→ or h/l    Select column", "Enter         Open board or toggle card",
                     "Space / click Toggle completion", "H/L or </>    Move card one column left/right",
                     "Drag & drop   Append card to another column", "a / e / d     Add, edit or delete card",
+                    "s             Add subtask to selection", "o             Owner (empty clears)",
+                    "B             Toggle #blocked", "i             Inspect task and notes",
                     "b / Esc       Back to board picker", "q             Quit",
                 ), 2):
                     if y < self.height - 2:
                         self._put(y, 0, line, curses.A_BOLD if y == 2 else 0)
+            elif ui.mode == "detail":
+                self._detail(ui)
             elif ui.read_error:
                 self._put(2, 0, "Cannot read file; waiting for it to become available.", curses.A_BOLD)
                 self._put(3, 0, ui.read_error)
