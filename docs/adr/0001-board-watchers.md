@@ -1,6 +1,6 @@
 # ADR 0001 — Board watchers and background shell actions
 
-Accepted for the local CLI and TUI.
+Accepted for the local CLI and TUI. [ADR 0002](0002-dbos-watcher-runtime.md) replaces the *Execution and recovery* and *Runner options* sections: DBOS now runs actions, reruns interrupted ones and keeps their output.
 
 ## Decision
 
@@ -23,7 +23,7 @@ The worker runs the registered command with the user's shell environment and the
 
 Each snapshot includes `text` (the task-line body), `done` (boolean), and sorted unique `owners` and `tags` arrays without their sigils. The [assignment log example](../../README.md#watchers) writes this object as a single line. A processor that needs deduplication can use the board path and job ID together. Task text is supplied as data through the environment. Quote environment expansions as shown in the example. Commands run with detached standard streams and can redirect output to files.
 
-## Execution and recovery
+## Execution and recovery (superseded by ADR 0002)
 
 After saving a board edit, KBTD commits all matching jobs to SQLite in one transaction. Each job captures its command and payload at enqueue time. Removing a definition affects future events. A short-lived worker runs queued jobs in ID order with one active worker per board. An operating-system-backed SQLite lock is released when the worker exits. The queue database remains available for edits while a command runs.
 
@@ -38,7 +38,7 @@ Opening the TUI, inspecting jobs or enqueuing a matching action wakes pending wo
 
 The atomic Markdown replacement and SQLite commit are separate operations. A crash between them can leave a saved edit without a job. A dispatch error after a successful edit is reported as such. Only queued jobs have the recovery guarantee. Arbitrary shell effects also cannot be committed atomically with the job result.
 
-## Runner options
+## Runner options (superseded by ADR 0002)
 
 | Option considered | Fit for KBTD |
 | --- | --- |
