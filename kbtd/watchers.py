@@ -54,7 +54,9 @@ _STATUS = {
     "ERROR": "failed", "MAX_RECOVERY_ATTEMPTS_EXCEEDED": "interrupted", "CANCELLED": "cancelled",
 }
 _RETRYABLE = {"ERROR", "MAX_RECOVERY_ATTEMPTS_EXCEEDED", "CANCELLED"}
+_CANCELLABLE = {"ENQUEUED", "DELAYED"}
 _LOG_LIMIT = 1 << 20
+_NOT_RETRYABLE = "only failed, interrupted or cancelled watcher jobs can be retried"
 
 
 class Watchers:
@@ -180,10 +182,10 @@ class Watchers:
     def emit(self, trigger: str, payload: dict) -> None:
         self.emit_many([(trigger, payload)])
 
-    # Inspection and retries go through the DBOS client.
+    # Inspection, retries and cancellations go through the DBOS client.
 
-    def jobs(self) -> list[dict]:
-        """Newest first. Wakes the worker so pending work resumes."""
+    def jobs(self, limit: int | None = None) -> list[dict]:
+        """Newest first, at most ``limit`` jobs. Wakes the worker so pending work resumes."""
         if not self.path.exists():
             return []
         self.wake()
@@ -191,10 +193,11 @@ class Watchers:
         if self._has_dbos_tables():
             with self._client() as client:
                 # Errors load with outputs; the detail column needs them.
-                for status in client.list_workflows(name=WORKFLOW, load_input=False):
+                for status in client.list_workflows(name=WORKFLOW, load_input=False,
+                                                    sort_desc=True, limit=limit):
                     job = _summary(status)
                     found[job["id"]] = job  # DBOS wins during the outbox handoff
-        return [found[key] for key in sorted(found, reverse=True)]
+        return [found[key] for key in sorted(found, reverse=True)][:limit]
 
     def job(self, job_id: int) -> dict:
         """Everything recorded about one job, including the action's output."""
@@ -221,17 +224,38 @@ class Watchers:
             with self._database() as db:
                 queued = db.execute("SELECT 1 FROM kbtd_outbox WHERE id = ?", (job_id,)).fetchone()
             if queued:
-                raise ValueError("only failed or interrupted watcher jobs can be retried")
+                raise ValueError(_NOT_RETRYABLE)
             if self._has_dbos_tables():
                 with self._client() as client:
                     status = _find(client, job_id)
                     if status is not None:
                         if status.status not in _RETRYABLE:
-                            raise ValueError("only failed or interrupted watcher jobs can be retried")
+                            raise ValueError(_NOT_RETRYABLE)
                         # Rewinding keeps the job ID and its recorded input, so the
                         # original command and payload run again on the same queue.
                         client.rewind_workflow(str(job_id), start_step=1)
                         self.wake()
+                        return
+        raise ValueError(f"no watcher job numbered {job_id}")
+
+    def cancel(self, job_id: int) -> None:
+        """Take a queued job off the queue before its command starts."""
+        if self.path.exists():
+            with self._database() as db:
+                handing_off = db.execute("SELECT 1 FROM kbtd_outbox WHERE id = ?", (job_id,)).fetchone()
+            if handing_off:
+                # The worker may be moving this row into DBOS right now. Deleting it
+                # here could race that handoff, so wait until DBOS owns the job.
+                raise ValueError(f"job {job_id} has not reached the worker yet; try again in a moment")
+            if self._has_dbos_tables():
+                with self._client() as client:
+                    status = _find(client, job_id)
+                    if status is not None:
+                        if status.status not in _CANCELLABLE:
+                            raise ValueError("only queued watcher jobs can be cancelled")
+                        # A job the worker dequeues between this check and the cancel
+                        # may still run: DBOS stops a workflow only between steps.
+                        client.cancel_workflow(str(job_id))
                         return
         raise ValueError(f"no watcher job numbered {job_id}")
 

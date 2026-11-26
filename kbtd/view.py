@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import curses
+import json
 import textwrap
 import unicodedata
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from .markdown import Column
@@ -29,6 +31,15 @@ def _clip(text: str, width: int, pad: bool = False) -> str:
         chars.append(ch)
         used += size
     return "".join(chars) + (" " * (width - used) if pad else "")
+
+
+def _local(stamp: str, today_format: str = "%H:%M:%S", other_format: str = "%Y-%m-%d") -> str:
+    """A job's UTC timestamp in local time."""
+    try:
+        moment = datetime.fromisoformat(stamp).astimezone()
+    except ValueError:
+        return stamp
+    return moment.strftime(today_format if moment.date() == datetime.now().astimezone().date() else other_format)
 
 
 class View:
@@ -153,6 +164,79 @@ class View:
         for y, line in enumerate(lines[ui.detail_scroll:ui.detail_scroll + capacity], 3):
             self._put(y, 0, line)
 
+    def _jobs(self, ui: BoardUI) -> None:
+        jobs = ui.jobs
+        shown = jobs.shown
+        if not jobs.all and jobs.error:
+            self._put(2, 0, "Cannot read watcher jobs", curses.A_BOLD)
+            self._put(3, 0, jobs.error)
+            return
+        if not shown:
+            self._put(2, 0, "No watcher jobs yet. Register a watcher with 'kbtd watch add'."
+                      if jobs.filter == "all" else f"No {jobs.filter} jobs.")
+            return
+        widths = [max(1, *(len(str(job["id"])) for job in shown)), 11,
+                  min(16, max(7, *(len(job["name"]) for job in shown))), 0, 3, 10]
+        # The trigger gets up to half of the space left after the fixed columns.
+        free = self.width - sum(widths) - 2 * len(widths)
+        widths[3] = max(7, min(max(len(job["trigger"]) for job in shown), free // 2))
+
+        def line(cells: list[str]) -> str:
+            return "  ".join(_clip(cell, width, pad=True) for cell, width in zip(cells, widths)) + "  " + cells[-1]
+
+        self._put(2, 0, line(["#".rjust(widths[0]), "STATUS", "WATCHER", "TRIGGER", "TRY", "UPDATED", "DETAIL"]),
+                  curses.A_BOLD | curses.A_UNDERLINE, pad=True)
+        size = self.height - 5
+        focus = jobs.index
+        first = max(0, focus - size + 1)
+        for y, i in enumerate(range(first, min(first + size, len(shown))), 3):
+            job = shown[i]
+            attr = (curses.A_BOLD if job["status"] in ("failed", "interrupted")
+                    else self.muted if job["status"] in ("succeeded", "cancelled") else curses.A_NORMAL)
+            if i == focus:
+                attr |= curses.A_REVERSE
+            self._put(y, 0, line([str(job["id"]).rjust(widths[0]), job["status"], job["name"], job["trigger"],
+                                  str(job["attempt"]).rjust(3), _local(job["updated_at"]), job["detail"]]),
+                      attr, pad=i == focus)
+
+    def _job(self, ui: BoardUI) -> None:
+        job = ui.jobs.detail
+        assert job is not None
+        self._put(2, 0, f"Job {job['id']} · {job['status']} · attempt {job['attempt']}", curses.A_BOLD)
+        fields = [("Watcher", job["name"]), ("Trigger", job["trigger"]), ("Command", job["command"] or ""),
+                  ("Created", _local(job["created_at"], "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S")),
+                  ("Updated", _local(job["updated_at"], "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S")),
+                  ("Exit code", "" if job["exit_code"] is None else str(job["exit_code"])),
+                  ("Result", job["detail"])]
+        source = [(f"{label:<10} {value}", 0) for label, value in fields if value]
+        event = job["event"]
+        source += [("", 0), ("Event", curses.A_BOLD)]
+        source += [(text, 0) for text in (json.dumps(event, indent=2, ensure_ascii=False).splitlines()
+                                          if event is not None else ["(not recorded)"])]
+        source += [("", 0), ("Output (last 8 KiB)", curses.A_BOLD)]
+        source += [(text, 0) for text in job["output"].splitlines() or ["(none)"]]
+        lines = [(part, attr) for text, attr in source
+                 for part in textwrap.wrap(text, width=self.width, drop_whitespace=False) or [""]]
+        capacity = self.height - 6
+        ui.detail_scroll = min(ui.detail_scroll, max(0, len(lines) - capacity))
+        for y, (text, attr) in enumerate(lines[ui.detail_scroll:ui.detail_scroll + capacity], 4):
+            self._put(y, 0, text, attr)
+
+    def _job_status(self, ui: BoardUI) -> str:
+        jobs = ui.jobs
+        if jobs.error:
+            return jobs.error
+        counts = {}
+        for job in jobs.all:
+            counts[job["status"]] = counts.get(job["status"], 0) + 1
+        newest = "newest " if len(jobs.all) >= jobs.limit else ""
+        parts = [f"{len(jobs.all)} {newest}jobs"]
+        parts += [f"{counts[status]} {status}" for status in ("running", "queued", "failed", "interrupted")
+                  if counts.get(status)]
+        if jobs.filter != "all":
+            parts.append(f"showing {jobs.filter}")
+        return " · ".join(parts)
+
     def _footer(self, ui: BoardUI) -> None:
         status = ui.notice
         if ui.mode in ("add", "edit", "subtask", "owner", "description", "due"):
@@ -173,17 +257,23 @@ class View:
                 hints = "y: delete   any other key: cancel"
             elif ui.mode == "detail":
                 hints = "↑/↓: scroll   Esc: back   q: quit"
+            elif ui.mode == "jobs":
+                status = status or self._job_status(ui)
+                hints = "↑/↓: job   Enter: details   r: retry   c: cancel   g: go to card   f: filter   Esc: back"
+            elif ui.mode == "job":
+                status = status or self._job_status(ui)
+                hints = "↑/↓ PgUp/PgDn: scroll   r: retry   c: cancel   g: go to card   Esc: back   q: quit"
             elif ui.mode == "help":
                 hints = "Press any key to return   q: quit"
             elif ui.section is None or ui.read_error:
-                hints = "↑/↓: board   Enter: open   ?: help   q: quit"
+                hints = "↑/↓: board   Enter: open   w: jobs   ?: help   q: quit"
             else:
                 if not status and ui.column and ui.board:
                     status = f"Column {ui.col + 1}/{len(ui.board.columns)} · {ui.column.name}"
                     if ui.card:
                         title = ui.card.text if ui.show_dates else ui.card.text_without_dates
                         status += f" · Task {ui.column.rows[ui.row][0]}: {title}"
-                hints = "?: help   q: quit   arrows: focus   Space: toggle   K/J: priority   H/L: column   a/e/d: add/edit/delete"
+                hints = "?: help   q: quit   w: jobs   arrows: focus   Space: toggle   K/J: priority   H/L: column   a/e/d: add/edit/delete"
             self._put(self.height - 2, 0, status, curses.A_BOLD)
         self._put(self.height - 1, 0, hints, curses.A_REVERSE, pad=True)
 
@@ -197,6 +287,8 @@ class View:
             self._put(0, 0, "Resize terminal (18×7 min); q quits")
         else:
             title = f"[Boards]  /  {ui.board.name}" if ui.board else "KBTD  /  Boards"
+            if ui.mode in ("jobs", "job"):
+                title += "  /  Jobs"
             self._put(0, 0, title, curses.A_BOLD)
             self._put(1, 0, str(ui.source.path), self.muted)
             if ui.mode == "help":
@@ -209,10 +301,16 @@ class View:
                     "s             Add subtask to selection", "o             Owner (empty clears)",
                     "B             Toggle #blocked", "i / D         Inspect task / edit description",
                     "u / v         Edit due date / show or hide dates",
+                    "w             Watcher jobs: Enter details, r retry, c cancel,",
+                    "              g go to card, f filter, Esc back",
                     "b / Esc       Back to board picker", "q             Quit",
                 ), 2):
                     if y < self.height - 2:
                         self._put(y, 0, line, curses.A_BOLD if y == 2 else 0)
+            elif ui.mode == "jobs":
+                self._jobs(ui)
+            elif ui.mode == "job":
+                self._job(ui)
             elif ui.mode == "detail":
                 self._detail(ui)
             elif ui.read_error:

@@ -26,6 +26,8 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     show.add_argument("id", type=int, help="job number from 'watch jobs'")
     retry = commands.add_parser("retry", parents=[common], help="rerun a failed or interrupted job")
     retry.add_argument("id", type=int, help="job number from 'watch jobs'")
+    cancel = commands.add_parser("cancel", parents=[common], help="cancel a queued job before it starts")
+    cancel.add_argument("id", type=int, help="job number from 'watch jobs'")
 
 
 def manage(path: Path, args: argparse.Namespace) -> None:
@@ -57,3 +59,6 @@ def manage(path: Path, args: argparse.Namespace) -> None:
         case "retry":
             watchers.retry(args.id)
             print(f"Queued job {args.id} for retry")
+        case "cancel":
+            watchers.cancel(args.id)
+            print(f"Cancelled job {args.id}")

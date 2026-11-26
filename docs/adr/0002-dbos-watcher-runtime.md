@@ -78,6 +78,8 @@ The workflow uses DBOS portable JSON serialization. Inputs, outputs, errors and 
 
 `kbtd watch retry ID` rewinds a failed, interrupted or cancelled job to its first step. It keeps the job number and its captured command and payload, and returns it to the queue. Rewinding resets the DBOS recovery counter but keeps the `attempt` attribute, so `ATTEMPT` counts every start of the command.
 
+`kbtd watch cancel ID` and the TUI's job view cancel a job only while DBOS holds it as `ENQUEUED` or `DELAYED`, with `DBOSClient.cancel_workflow`. A job still in `kbtd_outbox` is refused rather than deleted, because deleting the row would race the worker's handoff. DBOS checks for cancellation only between steps, so cancel cannot stop a running command, and a job dequeued between the status check and the cancel may still run. A cancelled job can be retried like a failed one.
+
 ## Consequences
 
 - **Actions run at least once.** If the worker stops during an action, the next worker runs the action again. After three starts DBOS stops and the job becomes `interrupted`. ADR 0001 never reran automatically. `KBTD_ATTEMPT` (1-based) lets a command detect a rerun; `KBTD_BOARD` plus `KBTD_JOB_ID` remain the deduplication key.

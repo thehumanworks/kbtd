@@ -109,6 +109,97 @@ class TuiTests(unittest.TestCase):
         self.assertEqual((self.ui.column.name, self.ui.card.text), ("Doing", "first @codex #docs"))
         self.assertEqual([job["trigger"] for job in watchers.jobs()], [condition])
 
+    def screen_text(self):
+        self.view.draw(self.ui)
+        return "\n".join(text for _, (text, _) in sorted(self.screen.entries.items()))
+
+    def test_jobs_view_lists_filters_acts_and_jumps_to_the_card(self):
+        stamp = "2026-01-02T03:04:05.000Z"
+        failed = {"id": 2, "name": "notify", "trigger": 'owner.changed = "codex"', "status": "failed",
+                  "attempt": 1, "detail": "exit code 9", "created_at": stamp, "updated_at": stamp}
+        done = {**failed, "id": 1, "status": "succeeded", "detail": "exit code 0"}
+        # The recorded path is stale: "second" was the first card when the job ran.
+        event = {"section": "Alpha", "section_number": 1, "column": "Queue", "column_number": 1,
+                 "path": "1", "after": {"text": "second"}}
+        detail = {**failed, "command": "./notify.sh", "event": event, "exit_code": 9, "output": "boom\n"}
+        listing = self.enterContext(patch.object(Watchers, "jobs", return_value=[failed, done]))
+        self.enterContext(patch.object(Watchers, "job", return_value=detail))
+        retry = self.enterContext(patch.object(Watchers, "retry"))
+        cancel = self.enterContext(patch.object(Watchers, "cancel",
+                                                side_effect=ValueError("only queued watcher jobs can be cancelled")))
+        ui = self.ui
+        ui.key("w")
+        text = self.screen_text()
+        self.assertIn("KBTD  /  Boards  /  Jobs", text)
+        self.assertIn("2 jobs", text)
+        self.assertIn("exit code 9", text)
+        self.assertEqual(ui.jobs.current["id"], 2)
+
+        ui.key("j")
+        self.assertEqual(ui.jobs.current["id"], 1)
+        listing.return_value = [{**failed, "id": 3, "status": "queued"}, failed, done]
+        self.assertTrue(ui.jobs.refresh(force=True))
+        self.assertEqual(ui.jobs.current["id"], 1)  # a new job does not move the selection
+        ui.key("f")
+        self.assertEqual((ui.jobs.filter, [j["id"] for j in ui.jobs.shown], ui.jobs.current["id"]),
+                         ("failed", [2], 2))
+        self.assertIn("showing failed", self.screen_text())
+        ui.key("r")
+        retry.assert_called_once_with(2)
+        self.assertEqual(ui.notice, "Queued job 2 for retry")
+        ui.key("c")
+        cancel.assert_called_once_with(2)
+        self.assertIn("only queued", self.screen_text())
+
+        self.source.path.write_text(self.source.path.read_text().replace("first", "first!"))
+        self.assertTrue(ui.poll())
+        self.assertEqual(ui.mode, "jobs")  # a board reload keeps the job view open
+        ui.key("\n")
+        text = self.screen_text()
+        self.assertEqual(ui.mode, "job")
+        for expected in ("Job 2 · failed · attempt 1", "./notify.sh", "Exit code  9"):
+            self.assertIn(expected, text)
+        self.assertNotIn("boom", text)
+        ui.key(curses.KEY_NPAGE)
+        text = self.screen_text()
+        for expected in ('"path": "1"', "Output (last 8 KiB)", "boom"):
+            self.assertIn(expected, text)
+        ui.key("?")
+        ui.key("x")
+        self.assertEqual(ui.mode, "job")
+
+        ui.key("g")
+        self.assertEqual((ui.mode, ui.board.name, ui.column.name, ui.card.text),
+                         ("browse", "Alpha", "Queue", "second"))
+        self.assertEqual(ui.notice, "Card from job 2")
+        detail["event"] = {**event, "after": {"text": "renamed"}}
+        ui.key("w")
+        ui.key("g")
+        self.assertEqual((ui.mode, ui.card.text), ("browse", "first!"))
+        self.assertIn("text changed", ui.notice)
+        detail["event"] = {**event, "section": "Gone"}
+        ui.key("w")
+        ui.key("g")
+        self.assertEqual(ui.mode, "jobs")
+        self.assertIn("no longer on this board", ui.notice)
+        ui.key("\x1b")
+        self.assertEqual((ui.mode, ui.board.name), ("browse", "Alpha"))
+
+    def test_jobs_view_reports_empty_history_and_errors(self):
+        jobs = self.enterContext(patch.object(Watchers, "jobs", return_value=[]))
+        self.ui.key("w")
+        self.assertIn("No watcher jobs yet", self.screen_text())
+        self.ui.key("f")
+        self.assertIn("No failed jobs.", self.screen_text())
+        for key in ("r", "c", "g", "\n"):
+            self.ui.key(key)
+        self.assertEqual(self.ui.mode, "jobs")
+        jobs.side_effect = RuntimeError("watcher jobs need the dbos package")
+        self.assertTrue(self.ui.jobs.refresh(force=True))
+        self.assertIn("need the dbos package", self.screen_text())
+        self.ui.key("w")
+        self.assertEqual(self.ui.mode, "browse")
+
     def test_theme_palettes_and_terminal_fallbacks(self):
         screen = Mock()
         with patch("curses.has_colors", return_value=False):

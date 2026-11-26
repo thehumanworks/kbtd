@@ -22,7 +22,7 @@ One SQLite file per board holds the DBOS tables plus `kbtd_watchers` and `kbtd_o
 
 ## Invariants to keep
 
-1. **The edit path never imports DBOS.** `emit_many`, `wake` and `_has_work` use `sqlite3` only, because `import dbos` costs about 0.45 s on every CLI edit. `tests/test_watchers.py::test_board_edits_record_jobs_without_importing_dbos` checks this. Code that needs DBOS (`add`, `jobs`, `job`, `retry`, the worker) imports it inside the function.
+1. **The edit path never imports DBOS.** `emit_many`, `wake` and `_has_work` use `sqlite3` only, because `import dbos` costs about 0.45 s on every CLI edit. `tests/test_watchers.py::test_board_edits_record_jobs_without_importing_dbos` checks this. Code that needs DBOS (`add`, `jobs`, `job`, `retry`, `cancel`, the worker) imports it inside the function. The TUI's job view (`w`, `JobList` in `kbtd/tui.py`) calls `jobs`, so DBOS loads only when that view opens.
 2. **One live worker per board.** The `.lock` file (an SQLite write lock that the OS releases when the process dies) is what makes DBOS startup recovery safe. Never launch DBOS on a board's database without holding it, except through `DBOSClient`, which does not recover anything.
 3. **Job number = workflow ID = priority.** `kbtd_outbox` uses `AUTOINCREMENT`, so numbers are never reused. Reuse would make a handoff "return-existing" and silently drop the new job. The priority keeps strict job order inside one millisecond.
 4. **Portable JSON only.** The workflow uses `WorkflowSerializationFormat.PORTABLE`. Keep inputs, outputs and attributes to JSON types. Errors return as `PortableWorkflowError`: read `.message`.
@@ -32,7 +32,7 @@ One SQLite file per board holds the DBOS tables plus `kbtd_watchers` and `kbtd_o
 
 ## Status mapping (used by `watch jobs` and `watch show`)
 
-`queued` = outbox row, `ENQUEUED` or `DELAYED` · `running` = `PENDING` · `succeeded` = `SUCCESS` · `failed` = `ERROR` · `interrupted` = `MAX_RECOVERY_ATTEMPTS_EXCEEDED` · `cancelled` = `CANCELLED`. `retry` rewinds `failed`, `interrupted` and `cancelled` jobs with `rewind_workflow(id, start_step=1)`.
+`queued` = outbox row, `ENQUEUED` or `DELAYED` · `running` = `PENDING` · `succeeded` = `SUCCESS` · `failed` = `ERROR` · `interrupted` = `MAX_RECOVERY_ATTEMPTS_EXCEEDED` · `cancelled` = `CANCELLED`. `retry` rewinds `failed`, `interrupted` and `cancelled` jobs with `rewind_workflow(id, start_step=1)`. `cancel` calls `cancel_workflow` only for `ENQUEUED` or `DELAYED` jobs. It refuses outbox rows, because deleting one would race `_hand_off`.
 
 ## Common tasks
 

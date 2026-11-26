@@ -254,6 +254,8 @@ class CliTests(unittest.TestCase):
         shown = json.loads(self.cli("-f", path, "watch", "show", str(both["id"])))
         self.assertEqual((shown["name"], shown["status"], shown["command"]), ("both", "queued", "exit 0"))
         self.assertIn("no watcher job numbered 99", self.cli("-f", path, "watch", "show", "99", ok=False))
+        # No worker ran, so the job is still in the outbox and cannot be cancelled yet.
+        self.assertIn("has not reached the worker", self.cli("-f", path, "watch", "cancel", str(both["id"]), ok=False))
         event = shown["event"]
         self.assertEqual((event["events"], event["trigger"], event["column"], event["path"]),
                          (["owner.changed", "tags.changed"], together, "Backlog", "1.1"))

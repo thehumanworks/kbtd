@@ -166,7 +166,7 @@ class WatchersTests(unittest.TestCase):
         self.watchers.retry(job["id"])
         retry = self.wait_for_job("succeeded")
         self.assertEqual((retry["id"], retry["attempt"], retry["command"]), (job["id"], 2, command))
-        with self.assertRaisesRegex(ValueError, "only failed or interrupted"):
+        with self.assertRaisesRegex(ValueError, "only failed, interrupted or cancelled"):
             self.watchers.retry(job["id"])
         with self.assertRaisesRegex(ValueError, "no watcher job numbered 99"):
             self.watchers.retry(99)
@@ -199,6 +199,38 @@ class WatchersTests(unittest.TestCase):
         self.watchers.retry(1)
         self.assertEqual(self.wait_for_job("succeeded")["attempt"], MAX_RECOVERIES + 2)
         self.assertEqual(starts.read_text().split(), [str(n) for n in range(1, MAX_RECOVERIES + 3)])
+
+    def test_cancel_takes_only_queued_jobs_off_the_queue(self):
+        runs = self.board.parent / "runs"
+        self.watchers.add("slow", "task.completed", self.command(
+            "import os, pathlib, time\n"
+            "with open('runs', 'a') as f: print(os.environ['KBTD_JOB_ID'], file=f)\n"
+            "for _ in range(1000):\n"
+            "    if pathlib.Path('unlock').exists(): break\n"
+            "    time.sleep(0.02)\n"
+        ))
+        with patch.object(Watchers, "_start_worker"):
+            self.watchers.emit("task.completed", {})
+            self.watchers.emit("task.completed", {})
+            with self.assertRaisesRegex(ValueError, "job 2 has not reached the worker"):
+                self.watchers.cancel(2)
+        self.watchers.wake()
+        self.wait_for_job("running", 1)
+        self.wait_for(lambda: not self.watchers._outbox(), "job 2 to reach DBOS")
+        with self.assertRaisesRegex(ValueError, "only queued"):
+            self.watchers.cancel(1)
+        self.watchers.cancel(2)
+        self.assertEqual(self.watchers.job(2)["status"], "cancelled")
+        (self.board.parent / "unlock").touch()
+        self.wait_for_job("succeeded", 1)
+        self.wait_for(self.worker_stopped, "the worker to go idle")
+        self.assertEqual(runs.read_text().split(), ["1"])
+        self.watchers.retry(2)
+        self.assertEqual(self.wait_for_job("succeeded", 2)["attempt"], 1)
+        self.assertEqual(runs.read_text().split(), ["1", "2"])
+        self.assertEqual([job["id"] for job in self.watchers.jobs(limit=1)], [2])
+        with self.assertRaisesRegex(ValueError, "no watcher job numbered 99"):
+            self.watchers.cancel(99)
 
     def worker_stopped(self):
         if not self.watchers.path.parent.exists():

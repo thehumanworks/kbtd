@@ -1,6 +1,7 @@
 """Curses event loop and interaction state. Card data always comes from a Snapshot."""
 
 import curses
+import time
 from collections.abc import Sequence
 
 from .events import Event, edit_events
@@ -14,10 +15,110 @@ UP = ("k", curses.KEY_UP)
 DOWN = ("j", curses.KEY_DOWN)
 LEFT = ("h", curses.KEY_LEFT)
 RIGHT = ("l", curses.KEY_RIGHT)
+PAGE = 10  # lines per PgUp/PgDn in the job view
+
+JOB_MODES = ("jobs", "job")
+# Each filter lists the job statuses it shows; None shows them all.
+JOB_FILTERS: dict[str, tuple[str, ...] | None] = {
+    "all": None, "failed": ("failed", "interrupted"), "running": ("running",), "queued": ("queued",),
+}
+JOB_REFRESH_SECONDS = 1.0
+JOB_LIMIT = 500
 
 
 def _clamp(index: int, size: int) -> int:
     return max(0, min(index, size - 1))
+
+
+def _locate(doc: Document, event: dict) -> tuple[tuple[int, int, int], bool] | None:
+    """Section, column and row of the card a watcher event names, and whether its text still matches.
+
+    Card paths are positions, so a later move or reorder makes the recorded path
+    point elsewhere. Prefer a card with the event's resulting text, nearest the
+    recorded position, then the recorded position itself.
+    """
+    text = (event.get("after") or {}).get("text")
+    best = None
+    for s, section in enumerate(doc.sections):
+        if section.name != event.get("section"):
+            continue
+        for c, column in enumerate(section.columns):
+            same_column = column.name == event.get("column")
+            for r, (path, card) in enumerate(column.rows):
+                same_text = text is not None and card.text == text
+                recorded = same_column and path == event.get("path")
+                if not (same_text or recorded):
+                    continue
+                rank = (same_text, s + 1 == event.get("section_number"), same_column,
+                        c + 1 == event.get("column_number"), recorded)
+                if best is None or rank > best[0]:
+                    best = rank, (s, c, r), same_text
+    return None if best is None else (best[1], best[2])
+
+
+class JobList:
+    """The job view's data. Selection follows the job number, so refreshes keep it."""
+
+    def __init__(self, watchers: Watchers):
+        self.watchers = watchers
+        self.all: list[dict] = []
+        self.filter = "all"
+        self.selected: int | None = None
+        self.position = 0  # fallback when the selected job leaves the filter
+        self.detail: dict | None = None
+        self.error = ""
+        self.loaded = float("-inf")
+        self.limit = JOB_LIMIT
+
+    @property
+    def shown(self) -> list[dict]:
+        statuses = JOB_FILTERS[self.filter]
+        return [job for job in self.all if statuses is None or job["status"] in statuses]
+
+    @property
+    def index(self) -> int:
+        shown = self.shown
+        found = next((i for i, job in enumerate(shown) if job["id"] == self.selected), None)
+        return _clamp(self.position if found is None else found, len(shown))
+
+    @property
+    def current(self) -> dict | None:
+        shown = self.shown
+        return shown[self.index] if shown else None
+
+    def _settle(self) -> None:
+        self.position = self.index
+        job = self.current
+        self.selected = job["id"] if job else None
+
+    def move(self, step: int) -> None:
+        self.position = self.index + step
+        self.selected = None
+        self._settle()
+
+    def cycle_filter(self) -> None:
+        names = list(JOB_FILTERS)
+        self.filter = names[(names.index(self.filter) + 1) % len(names)]
+        self._settle()
+
+    def open(self, job_id: int) -> None:
+        self.detail = self.watchers.job(job_id)
+
+    def refresh(self, force: bool = False) -> bool:
+        """Reload at most once per JOB_REFRESH_SECONDS; return whether anything changed."""
+        if not force and time.monotonic() - self.loaded < JOB_REFRESH_SECONDS:
+            return False
+        self.loaded = time.monotonic()
+        before = self.all, self.detail, self.error
+        try:
+            self.all = self.watchers.jobs(limit=self.limit)
+            if self.detail is not None:
+                self.open(self.detail["id"])
+            self.error = ""
+        except (OSError, RuntimeError, ValueError) as e:
+            self.error = str(e)
+        self._settle()
+        return (self.all, self.detail, self.error) != before
 
 
 class BoardUI:
@@ -34,9 +135,12 @@ class BoardUI:
         self.drag: tuple[int, int] | None = None
         self.notice = ""
         self.read_error = ""
+        self.help_from = "browse"
+        self.watchers = Watchers(source.path)
+        self.jobs = JobList(self.watchers)
         self._install(snapshot, self.state.load())
         try:
-            Watchers(source.path).wake()
+            self.watchers.wake()
         except (OSError, RuntimeError) as e:
             self.notice = f"Watcher recovery failed: {e}"
 
@@ -82,7 +186,8 @@ class BoardUI:
             else:
                 self.state.save(None)
         self.drag = None
-        self.mode = "browse"
+        if self.mode not in JOB_MODES:  # the job view does not show the board
+            self.mode = "browse"
         self._fit()
 
     def select(self, section: int | None) -> None:
@@ -102,11 +207,17 @@ class BoardUI:
         except (OSError, UnicodeError) as e:
             changed = self.read_error != str(e)
             self.read_error = str(e)
-            self.mode, self.drag = "browse", None
+            self.drag = None
+            if self.mode not in JOB_MODES:
+                self.mode = "browse"
             return changed
         self.read_error = ""
         self.notice = "Reloaded from disk"
         return True
+
+    def refresh_jobs(self) -> bool:
+        """Return whether the open job view changed."""
+        return self.mode in JOB_MODES and self.jobs.refresh()
 
     def _save_edit(self, document: Document) -> bool:
         assert self.section is not None and self.column is not None
@@ -184,6 +295,71 @@ class BoardUI:
             self.draft = self.draft[: self.caret] + key + self.draft[self.caret :]
             self.caret += len(key)
 
+    def _open_jobs(self) -> None:
+        self.mode, self.jobs.detail = "jobs", None
+        self.jobs.refresh(force=True)
+
+    def _jump(self, job_id: int, event: dict | None) -> None:
+        if self.read_error:
+            self.notice = "The board file is unavailable"
+            return
+        found = _locate(self.doc, event or {})
+        if found is None:
+            self.notice = f"The card from job {job_id} is no longer on this board"
+            return
+        (section, col, row), same_text = found
+        self.select(section)
+        self.col, self.row = col, row
+        self._fit()
+        self.mode, self.jobs.detail = "browse", None
+        self.notice = (f"Card from job {job_id}" if same_text
+                       else f"Card text changed since job {job_id}; showing its recorded position")
+
+    def _job_action(self, key: str, job: dict) -> None:
+        job_id = job["id"]
+        try:
+            if key == "r":
+                self.watchers.retry(job_id)
+                self.notice = f"Queued job {job_id} for retry"
+            elif key == "c":
+                self.watchers.cancel(job_id)
+                self.notice = f"Cancelled job {job_id}"
+            else:
+                self._jump(job_id, (self.jobs.detail or self.watchers.job(job_id))["event"])
+                return
+        except (OSError, RuntimeError, ValueError) as e:
+            self.notice = str(e)
+        self.jobs.refresh(force=True)
+
+    def _jobs_key(self, key: str | int) -> None:
+        jobs, detail = self.jobs, self.mode == "job"
+        job = jobs.detail if detail else jobs.current
+        if key == "\x1b" or (key == "w" and not detail) or (detail and key in LEFT):
+            if detail:
+                self.mode, jobs.detail = "jobs", None
+            else:
+                self.mode = "browse"
+        elif key == "?":
+            self.help_from, self.mode = self.mode, "help"
+        elif detail and key in (*UP, *DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
+            step = PAGE if key in (curses.KEY_PPAGE, curses.KEY_NPAGE) else 1
+            down = key in (*DOWN, curses.KEY_NPAGE)
+            self.detail_scroll = max(0, self.detail_scroll + (step if down else -step))
+        elif key in UP + DOWN:
+            jobs.move(1 if key in DOWN else -1)
+        elif key == "f" and not detail:
+            jobs.cycle_filter()
+        elif job is None:
+            pass
+        elif key in ENTER and not detail:
+            try:
+                jobs.open(job["id"])
+                self.mode, self.detail_scroll = "job", 0
+            except (OSError, RuntimeError, ValueError) as e:
+                self.notice = str(e)
+        elif key in ("r", "c", "g"):
+            self._job_action(key, job)
+
     def key(self, key: str | int) -> bool:
         """Handle a key; False exits. Mouse events are dispatched separately."""
         self.notice = ""
@@ -193,19 +369,23 @@ class BoardUI:
             self._input(key)
         elif key == "q":
             return False
+        elif self.mode in JOB_MODES:
+            self._jobs_key(key)
         elif self.mode == "detail":
             if key in UP + DOWN:
                 self.detail_scroll = max(0, self.detail_scroll + (1 if key in DOWN else -1))
             else:
                 self.mode = "browse"
         elif self.mode == "help":
-            self.mode = "browse"
+            self.mode, self.help_from = self.help_from, "browse"
         elif self.mode == "delete":
             if key in ("y", "Y") and self.card:
                 self._save(self.doc.delete(self.card))
             self.mode = "browse"
         elif key == "?":
-            self.mode = "help"
+            self.help_from, self.mode = "browse", "help"
+        elif key == "w":
+            self._open_jobs()
         elif self.read_error:
             pass  # Never edit the stale snapshot while the file is unavailable.
         elif self.section is None:
@@ -337,6 +517,8 @@ def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot, theme: st
         except curses.error:  # polling timeout
             key = None
         changed = ui.poll()
+        # Job selection follows the job number, so a refresh need not drop the key.
+        refreshed = ui.refresh_jobs()
         # A key/click on the old layout must not act on a different card.
         if view.too_small:
             if key == "q":
@@ -349,7 +531,7 @@ def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot, theme: st
             ui.mouse(view, x, y, buttons)
         elif not changed and key is not None and not ui.key(key):
             break
-        if key is not None or changed:
+        if key is not None or changed or refreshed:
             view.draw(ui)
 
 

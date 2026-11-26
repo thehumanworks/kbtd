@@ -157,6 +157,7 @@ Both Vercel themes use gray for secondary text on 256-color terminals. Basic col
 | `u` / `v` | Edit the due date / toggle date visibility for this session. Enter saves the date. An empty draft clears it. |
 | `B` | Mark or unmark the selected task as blocked |
 | `i` | Inspect the selected Markdown subtree, including notes; ↑/↓ scroll, Esc returns |
+| `w` | Open this file's [watcher jobs](#job-history-and-recovery), from the picker or a board |
 | `d` | Delete selected task, its descendants and notes after confirmation |
 | `b` / Esc / click `[Boards]` | Return to the section picker |
 | `?` / `q` | Show shortcuts / quit |
@@ -210,11 +211,24 @@ Use `kbtd watch list` to see definitions and `kbtd watch remove NAME` to stop fu
 | `running` | The action started. After a reboot or a killed worker, the job shows `running` until the next worker reruns it. |
 | `succeeded` / `failed` | The command exited with code 0 / another code, or could not start. |
 | `interrupted` | The worker stopped during each of three starts. KBTD stops rerunning it. |
-| `cancelled` | Someone cancelled the job with the DBOS tools. |
+| `cancelled` | Someone cancelled the job before it started, with `kbtd watch cancel`, the TUI or the DBOS tools. |
 
 Actions run **at least once**. If the worker stops during an action, the next worker runs it again, up to three starts in total. Opening the TUI, listing jobs or an edit that matches a watcher starts that worker. `KBTD_ATTEMPT` tells the command which start this is. Use `KBTD_BOARD` and `KBTD_JOB_ID` together to deduplicate side effects.
 
-`kbtd watch show ID` prints one job as JSON: its command, event, exit code and the last 8 KiB of the command's combined output. `kbtd watch retry ID` reruns a failed, interrupted or cancelled job with its original command and event. A retry can repeat a shell side effect.
+`kbtd watch show ID` prints one job as JSON: its command, event, exit code and the last 8 KiB of the command's combined output. `kbtd watch retry ID` reruns a failed, interrupted or cancelled job with its original command and event. A retry can repeat a shell side effect. `kbtd watch cancel ID` takes a queued job off the queue. It cannot stop a command that has started, and a job the worker picks up at that moment may still run. Right after an edit, a job may take about a second to reach the worker; until then, cancel asks you to try again.
+
+In the TUI, `w` opens the same history, newest first, and refreshes it every second. It shows the newest 500 jobs.
+
+| Key | Job list | Job details |
+| --- | --- | --- |
+| ↑/↓ | Select a job | Scroll; PgUp/PgDn scroll a page |
+| Enter | Show the command, event, exit code and output tail | |
+| `r` / `c` | Retry / cancel the selected job | Retry / cancel this job |
+| `g` | Go to the card that triggered the job | Same |
+| `f` | Show all, failed or interrupted, running, or queued jobs | |
+| Esc | Back to the board or picker | Back to the list |
+
+Card paths are positions, so `g` first looks in the job's section for a card with the text the edit left, nearest its recorded column and path. If none matches, it selects the recorded position and says that the text changed.
 
 Each board's watchers live in one SQLite file under `$XDG_STATE_HOME/kbtd/watchers` (default `~/.local/state/kbtd/watchers`). It is a standard DBOS system database, so the [DBOS CLI](https://docs.dbos.dev/python/reference/cli) can inspect it too, for example `uv run dbos workflow steps 3 -s sqlite:///PATH`. Worker diagnostics go to the `.log` file next to it. [ADR 0001](docs/adr/0001-board-watchers.md) defines triggers and the event contract. [ADR 0002](docs/adr/0002-dbos-watcher-runtime.md) explains the DBOS runtime and how it can move to Postgres.
 
