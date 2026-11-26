@@ -1,10 +1,13 @@
 """Curses event loop and interaction state. Card data always comes from a Snapshot."""
 
 import curses
+from collections.abc import Sequence
 
+from .events import Event, edit_events
 from .markdown import Card, Column, Document, Section
 from .storage import BoardFile, SectionKey, SelectionStore, Snapshot
 from .view import View
+from .watchers import Watchers
 
 ENTER = ("\n", "\r", curses.KEY_ENTER)
 UP = ("k", curses.KEY_UP)
@@ -26,11 +29,16 @@ class BoardUI:
         self.mode = "browse"
         self.draft = ""
         self.detail_scroll = 0
+        self.show_dates = True
         self.caret = 0
         self.drag: tuple[int, int] | None = None
         self.notice = ""
         self.read_error = ""
         self._install(snapshot, self.state.load())
+        try:
+            Watchers(source.path).wake()
+        except (OSError, RuntimeError) as e:
+            self.notice = f"Watcher recovery failed: {e}"
 
     @property
     def doc(self) -> Document:
@@ -100,16 +108,22 @@ class BoardUI:
         self.notice = "Reloaded from disk"
         return True
 
-    def _save(self, document: Document) -> bool:
+    def _save_edit(self, document: Document) -> bool:
+        assert self.section is not None and self.column is not None
+        path, _ = self.column.rows[self.row]
+        events = edit_events(self.doc, document, self.section, self.col, path)
+        return self._save(document, events)
+
+    def _save(self, document: Document, events: Sequence[Event] = ()) -> bool:
         if document is self.doc:
             self.mode, self.notice = "browse", "Unchanged"
             return True
         try:
-            self._install(self.source.save(document), self._key())
+            self._install(self.source.save(document, events), self._key())
         except (OSError, UnicodeError) as e:
             self.notice = f"Not saved: {e}"
             return False
-        self.notice = "Saved"
+        self.notice = self.snapshot.watcher_warning or "Saved"
         return True
 
     def _move(self, source: int, row: int, dest: int) -> None:
@@ -140,9 +154,13 @@ class BoardUI:
                         self.row = next((i for i, (_, child) in enumerate(self.column.rows)
                                          if child.start == card.end), self.row)
                 elif self.mode == "owner" and card:
-                    self._save(self.doc.set_owner(card, self.draft or None))
+                    self._save_edit(self.doc.set_owner(card, self.draft or None))
+                elif self.mode == "description" and card:
+                    self._save(self.doc.set_description(card, self.draft))
+                elif self.mode == "due" and card:
+                    self._save_edit(self.doc.set_due(card, self.draft or None))
                 elif card:
-                    self._save(self.doc.edit(card, self.draft))
+                    self._save_edit(self.doc.edit(card, self.draft))
             except ValueError as e:
                 self.notice = str(e)
         elif key in ("\x7f", "\b", curses.KEY_BACKSPACE):
@@ -159,6 +177,9 @@ class BoardUI:
             self.caret = 0
         elif key == curses.KEY_END:
             self.caret = len(self.draft)
+        elif self.mode == "description" and key == "\x0e":
+            self.draft = self.draft[:self.caret] + "\n" + self.draft[self.caret:]
+            self.caret += 1
         elif isinstance(key, str) and key.isprintable():
             self.draft = self.draft[: self.caret] + key + self.draft[self.caret :]
             self.caret += len(key)
@@ -168,7 +189,7 @@ class BoardUI:
         self.notice = ""
         if key == curses.KEY_RESIZE:
             return True
-        if self.mode in ("add", "edit", "subtask", "owner"):
+        if self.mode in ("add", "edit", "subtask", "owner", "description", "due"):
             self._input(key)
         elif key == "q":
             return False
@@ -194,6 +215,9 @@ class BoardUI:
                 self.select(self.pick)
         elif key in ("b", "\x1b"):
             self.select(None)
+        elif key == "v":
+            self.show_dates = not self.show_dates
+            self.notice = "Due dates visible" if self.show_dates else "Due dates hidden"
         elif key in LEFT + RIGHT:
             self.col += 1 if key in RIGHT else -1
             self._fit()
@@ -204,17 +228,29 @@ class BoardUI:
             self.mode, self.draft, self.caret = "add", "", 0
         elif card := self.card:
             if key in (*ENTER, " "):
-                self._save(self.doc.toggle(card))
+                self._save_edit(self.doc.toggle(card))
             elif key in ("H", "<", "L", ">"):
                 self._move(self.col, self.row, self.col + (1 if key in ("L", ">") else -1))
+            elif key in ("K", "J") and self.column:
+                path = self.column.rows[self.row][0]
+                changed, new_path = self.doc.reorder(self.column, path, -1 if key == "K" else 1)
+                if self._save(changed) and self.column:
+                    self.row = next((i for i, (p, _) in enumerate(self.column.rows)
+                                     if p == new_path), self.row)
             elif key == "s":
                 self.mode, self.draft, self.caret = "subtask", "", 0
             elif key == "i":
                 self.mode, self.detail_scroll = "detail", 0
-            elif key in ("o", "B"):
+            elif key == "D":
+                self.draft = card.description
+                self.mode, self.caret = "description", len(self.draft)
+            elif key in ("o", "B", "u"):
                 try:
                     if key == "B":
-                        self._save(self.doc.set_blocked(card, not card.blocked))
+                        self._save_edit(self.doc.set_blocked(card, not card.blocked))
+                    elif key == "u":
+                        self.draft = card.due
+                        self.mode, self.caret = "due", len(self.draft)
                     else:
                         owner = card.field("owner")
                         self.draft = owner[0][1:] if owner else ""
@@ -247,13 +283,39 @@ class BoardUI:
             elif hit and start == hit:
                 self.col, self.row = hit
                 if self.card:
-                    self._save(self.doc.toggle(self.card))
+                    self._save_edit(self.doc.toggle(self.card))
             else:
                 self.col = dest
                 self._fit()
 
 
-def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot) -> None:
+def _apply_theme(screen: curses.window, theme: str) -> int:
+    """Set the window background and return the attribute for secondary text."""
+    if not curses.has_colors():
+        return curses.A_DIM
+    if theme == "system":
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        return curses.A_DIM
+    # The 256-color cube has fixed black and white, independent of ANSI slots.
+    extended = curses.COLORS >= 256
+    black, white = (16, 231) if extended else (curses.COLOR_BLACK, curses.COLOR_WHITE)
+    light = theme == "vercel-light"
+    foreground, background = (black, white) if light else (white, black)
+    try:
+        curses.init_pair(1, foreground, background)
+        screen.bkgd(" ", curses.color_pair(1))
+        if extended:
+            curses.init_pair(2, 241 if light else 247, background)
+            return curses.color_pair(2)
+    except curses.error:
+        pass
+    return curses.A_DIM
+
+
+def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot, theme: str) -> None:
     screen.timeout(250)
     if hasattr(curses, "set_escdelay"):
         curses.set_escdelay(30)
@@ -267,15 +329,7 @@ def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot) -> None:
         curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED | curses.BUTTON1_CLICKED)
     except curses.error:
         pass
-    accent = curses.A_BOLD
-    if curses.has_colors():
-        try:
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_CYAN, -1)
-            accent |= curses.color_pair(1)
-        except curses.error:
-            pass
-    ui, view = BoardUI(source, snapshot), View(screen, accent)
+    ui, view = BoardUI(source, snapshot), View(screen, _apply_theme(screen, theme))
     view.draw(ui)
     while True:
         try:
@@ -299,8 +353,8 @@ def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot) -> None:
             view.draw(ui)
 
 
-def run_tui(source: BoardFile, snapshot: Snapshot) -> None:
+def run_tui(source: BoardFile, snapshot: Snapshot, theme: str = "system") -> None:
     try:
-        curses.wrapper(_run, source, snapshot)
+        curses.wrapper(_run, source, snapshot, theme)
     except curses.error as e:
         raise RuntimeError(f"terminal error: {e}; use 'kbtd list' for plain text") from e

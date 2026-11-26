@@ -32,8 +32,8 @@ def _clip(text: str, width: int, pad: bool = False) -> str:
 
 
 class View:
-    def __init__(self, screen: curses.window, accent: int = curses.A_BOLD):
-        self.screen, self.accent = screen, accent
+    def __init__(self, screen: curses.window, muted: int = curses.A_DIM):
+        self.screen, self.muted = screen, muted
         self.picks: dict[int, int] = {}
         self.lanes: list[tuple[int, int, int]] = []  # left, right (exclusive), column
         self.rows: dict[tuple[int, int], int] = {}  # (column, screen y) -> card
@@ -73,7 +73,8 @@ class View:
         if not ui.doc.sections:
             self._put(3, 0, "No boards yet. Add a '# Section' and '## Column' in the file.")
 
-    def _cards(self, column: Column, index: int, x: int, width: int, focus: int | None) -> None:
+    def _cards(self, column: Column, index: int, x: int, width: int, focus: int | None,
+               show_dates: bool) -> None:
         capacity = self.height - 5
 
         def margin(i: int) -> str:
@@ -82,7 +83,10 @@ class View:
 
         def wrap(i: int) -> list[str]:
             card = column.rows[i][1]
-            label = ("BLOCKED · " if card.blocked else "") + card.text
+            dates = ""
+            if show_dates and card.date_tokens:
+                dates = "Due " + ", ".join(m[0].removeprefix("#due-") for m in card.date_tokens) + " · "
+            label = ("BLOCKED · " if card.blocked else "") + dates + card.text_without_dates
             return textwrap.wrap(label, width=max(1, width - 5 - len(margin(i))),
                                  max_lines=min(3, capacity), placeholder="…") or [""]
 
@@ -99,7 +103,7 @@ class View:
         y = 3
         for i in range(first, len(column.rows)):
             _, card = column.rows[i]
-            attr = curses.A_DIM if card.done else curses.A_NORMAL
+            attr = self.muted if card.done else curses.A_NORMAL
             if card.blocked:
                 attr |= curses.A_BOLD
             if i == focus:
@@ -113,7 +117,7 @@ class View:
                 if y >= self.height - 2:
                     return
         if not column.cards:
-            self._put(y, x, " (empty)", curses.A_DIM, width)
+            self._put(y, x, " (empty)", self.muted, width)
 
     def _board(self, ui: BoardUI) -> None:
         board = ui.board
@@ -129,12 +133,12 @@ class View:
             self.lanes.append((left, right, i))
             if j:
                 for y in range(2, self.height - 2):
-                    self._put(y, left, "│", curses.A_DIM, 1)
+                    self._put(y, left, "│", self.muted, 1)
                 left += 1
             column = board.columns[i]
-            attr = self.accent | (curses.A_REVERSE if i == ui.col else curses.A_UNDERLINE)
+            attr = curses.A_BOLD | (curses.A_REVERSE if i == ui.col else curses.A_UNDERLINE)
             self._put(2, left, f" {i + 1}. {column.name} ({len(column.cards)})", attr, right - left, pad=True)
-            self._cards(column, i, left, right - left, ui.row if i == ui.col else None)
+            self._cards(column, i, left, right - left, ui.row if i == ui.col else None, ui.show_dates)
 
     def _detail(self, ui: BoardUI) -> None:
         card = ui.card
@@ -151,13 +155,17 @@ class View:
 
     def _footer(self, ui: BoardUI) -> None:
         status = ui.notice
-        if ui.mode in ("add", "edit", "subtask", "owner"):
+        if ui.mode in ("add", "edit", "subtask", "owner", "description", "due"):
             label = {"add": "New card: ", "edit": "Edit: ", "subtask": "New child: ",
-                     "owner": "Owner: "}[ui.mode]
+                     "owner": "Owner: ", "description": "Description: ", "due": "Due: "}[ui.mode]
             # Keep the insertion point visible when editing a long line.
-            before = _clip(ui.draft[:ui.caret][::-1], self.width - len(label) - 2)[::-1]
-            self._put(self.height - 2, 0, label + before + "▏" + ui.draft[ui.caret:], curses.A_BOLD)
-            hints = status or "Enter: save   Esc: cancel   ←/→: edit"
+            display = ui.draft.replace("\n", "↵")
+            before = _clip(display[:ui.caret][::-1], self.width - len(label) - 2)[::-1]
+            self._put(self.height - 2, 0, label + before + "▏" + display[ui.caret:], curses.A_BOLD)
+            hints = "Enter: save   Esc: cancel   ←/→: edit"
+            if ui.mode == "description":
+                hints += "   Ctrl-N: new line"
+            hints = status or hints
         else:
             if ui.mode == "delete":
                 status = ("Delete subtree AND notes? (y/N)" if ui.card and ui.card.children
@@ -173,8 +181,9 @@ class View:
                 if not status and ui.column and ui.board:
                     status = f"Column {ui.col + 1}/{len(ui.board.columns)} · {ui.column.name}"
                     if ui.card:
-                        status += f" · Task {ui.column.rows[ui.row][0]}: {ui.card.text}"
-                hints = "?: help   q: quit   b: boards   arrows: focus   Space: toggle   H/L: move   a/e/d: add/edit/delete"
+                        title = ui.card.text if ui.show_dates else ui.card.text_without_dates
+                        status += f" · Task {ui.column.rows[ui.row][0]}: {title}"
+                hints = "?: help   q: quit   arrows: focus   Space: toggle   K/J: priority   H/L: column   a/e/d: add/edit/delete"
             self._put(self.height - 2, 0, status, curses.A_BOLD)
         self._put(self.height - 1, 0, hints, curses.A_REVERSE, pad=True)
 
@@ -188,16 +197,18 @@ class View:
             self._put(0, 0, "Resize terminal (18×7 min); q quits")
         else:
             title = f"[Boards]  /  {ui.board.name}" if ui.board else "KBTD  /  Boards"
-            self._put(0, 0, title, self.accent)
-            self._put(1, 0, str(ui.source.path), curses.A_DIM)
+            self._put(0, 0, title, curses.A_BOLD)
+            self._put(1, 0, str(ui.source.path), self.muted)
             if ui.mode == "help":
                 for y, line in enumerate((
                     "Keyboard & mouse", "↑/↓ or k/j    Select board or card",
                     "←/→ or h/l    Select column", "Enter         Open board or toggle card",
                     "Space / click Toggle completion", "H/L or </>    Move card one column left/right",
+                    "K/J           Move task up/down among siblings",
                     "Drag & drop   Append card to another column", "a / e / d     Add, edit or delete card",
                     "s             Add subtask to selection", "o             Owner (empty clears)",
-                    "B             Toggle #blocked", "i             Inspect task and notes",
+                    "B             Toggle #blocked", "i / D         Inspect task / edit description",
+                    "u / v         Edit due date / show or hide dates",
                     "b / Esc       Back to board picker", "q             Quit",
                 ), 2):
                     if y < self.height - 2:

@@ -8,10 +8,13 @@ import json
 import os
 import stat
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .events import Event
 from .markdown import Document, parse_markdown
+from .watchers import Watchers
 
 
 TEMPLATE = "# Tasks\n\n## Backlog\n\n## In Progress\n\n## Done\n"
@@ -27,6 +30,7 @@ def _version(st: os.stat_result) -> Version:
 class Snapshot:
     document: Document
     version: Version
+    watcher_warning: str = ""
 
 
 def _atomic_write(path: Path, text: str, mode: int | None = None) -> None:
@@ -61,12 +65,18 @@ class BoardFile:
             version = _version(os.fstat(f.fileno()))
             return Snapshot(parse_markdown(f.read()), version)
 
-    def save(self, document: Document) -> Snapshot:
+    def save(self, document: Document, events: Sequence[Event] = ()) -> Snapshot:
         mode = stat.S_IMODE(self.path.stat().st_mode)
         if not os.access(self.path, os.W_OK):
             raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), self.path)
         _atomic_write(self.path, document.serialize(), mode)
-        return self.load()
+        snapshot = self.load()
+        if events:
+            try:
+                Watchers(self.path).emit_many(events)
+            except (OSError, RuntimeError, ValueError) as e:
+                return replace(snapshot, watcher_warning=f"Board saved. Watcher dispatch failed: {e}")
+        return snapshot
 
 
 class SelectionStore:

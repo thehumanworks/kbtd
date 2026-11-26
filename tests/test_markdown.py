@@ -104,6 +104,31 @@ class MarkdownTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fenced note"):
             doc.add_child(parent, "not really a task")
 
+    def test_description_header_is_scoped_to_one_task(self):
+        header = "    Description: first\r\n    Description:\n    Description: last\r\n"
+        text = ("# S\r\n## C\r\n- [ ] Root\r\n  Description: root\r\n  - [ ] Child\r\n"
+                + header + "    legacy note\r\n    Description: quoted in prose\r\n"
+                "    - [ ] Grandchild\r\n      Description: keep me")
+        doc = parse_markdown(text)
+        parent, child, leaf = (card for _, card in doc.sections[0].columns[0].rows)
+        self.assertEqual((parent.description, child.description, leaf.description),
+                         ("root", "first\n\nlast", "keep me"))
+        self.assertIs(doc.set_description(child, child.description), doc)
+        self.assertEqual(doc.set_description(child, "new\r\nline").serialize(),
+                         text.replace(header, "    Description: new\r\n    Description: line\n"))
+        self.assertEqual(doc.set_description(child, None).serialize(), text.replace(header, ""))
+        self.assertEqual(doc.set_description(leaf, "  end ").serialize(),
+                         text.replace("Description: keep me", "Description:   end "))
+
+    def test_due_uses_one_suffix_tag_and_preserves_legacy_dates_in_prose(self):
+        text = "# S\r\n## C\r\n- [ ] before #due-2027-01-01 is prose @alice\t#due-2028-02-29 #ops "
+        doc = parse_markdown(text)
+        card = doc.sections[0].columns[0].resolve("1")
+        self.assertEqual(card.due, "2028-02-29")
+        self.assertIs(doc.set_due(card, card.due), doc)
+        self.assertEqual(doc.set_due(card, "2028-03-01").serialize(), text.replace("02-29", "03-01"))
+        self.assertEqual(doc.set_due(card, None).serialize(), text.replace("\t#due-2028-02-29", ""))
+
     def test_metadata_edits_touch_only_one_suffix_token(self):
         line = "- [x] Ask @jo about a@b.co and https://docs/#blocked #keep\t@ada  #ops  "
         doc = parse_markdown("# TODO\r\n## Here\r\n" + line + "\r\n  note @ada #blocked")

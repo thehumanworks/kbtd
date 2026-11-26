@@ -8,15 +8,15 @@ The authority for file syntax is [todo-md/todo-md, README at revision `d49e3c7`]
 
 | Request | Evidence from the standard | Implementation boundary |
 | --- | --- | --- |
-| F1 · Description | Tasks are one-liners. The Example shows an indented URL beneath a task, but assigns it no field name or boundary. | Preserve attached text. It may be displayed as notes; do not silently convert it into an editable description or delete it when clearing a field. A distinct description needs an agreed mapping. |
-| F2 · Due date | Metadata defines people and tags, not dates. | No native due date. Do not write a date marker until a convention is approved. A view toggle is a display choice, not file syntax. |
+| F1 · Description | The example permits indented notes beneath a task. | KBTD recognizes a leading group of explicitly labeled description lines within those notes. See §3 for the exact scope. |
+| F2 · Due date | Metadata includes ordinary tags. | KBTD recognizes a calendar date in a trailing `#due-YYYY-MM-DD` tag. The TUI date view is local to the session. |
 | F3 · Blocked flag and note | `#TAG` is standard; “blocked” is not a checkbox state. `- [-]` means **declined**. No blocker-note field is defined. | Implement the recommended mapping: render the exact lowercase token `#blocked` in the trailing group of space/tab-separated owner and tag tokens on the selected task line as a badge. Marking adds the token only if absent; unmarking removes just that token and one separator. Reject duplicate blocked tokens on flag edits; leave other tags, prose and checkbox state untouched. Other clients see a tag, not a new state. Treat a separately editable blocker note as unresolved even if the tag convention is approved. |
 | F4 · Owner | Metadata specifies `@USERNAME`. | Ready: set, replace and remove an owner on the selected task line. Do not rewrite other tags, mentions embedded in prose, or a child's owner. If multiple owner candidates are ambiguous, report that rather than picking one for a destructive edit. |
 | F5 · Subtasks | Structure and Example show a checkbox task indented two spaces under its parent. | Ready: support at least the demonstrated parent–child form. A nested checkbox is a task, not description text and not a top-level card. Do not assume arbitrary indented prose is a child. |
 | F6 · Delete | Structure defines deleted as “removed from the document”. | Ready: remove the selected task, not mark it declined or done. Removing its attached subtree is KBTD's deletion policy, not an additional TODO.md state. |
 | F7 · Manual editing | The examples are ordinary editable Markdown. | Document native syntax separately from any approved KBTD display conventions. Do not document a deferred field as supported. |
 
-**Decision for non-native fields:** By default, deliver the native behaviors and report the remaining parts as deferred, not passed. If the maintainer approves conventions within standard syntax, record each exact spelling, scope, collision rule and clear operation here **before** implementation. Approval of the upstream standard alone does not approve a convention. In particular, a description and a blocker note must be distinguishable on disk before an agent promises independent edits. Do not introduce a fourth checkbox, private metadata blocks, hidden comments, IDs or a sidecar.
+Descriptions, due dates and the blocked badge use KBTD conventions within ordinary Markdown notes and tags. A separately editable blocker note still needs a distinct representation.
 
 **Legacy files:** Upstream starts files with `# TODO` and shows tasks directly under `# BACKLOG` and `# DONE` as well as under H2 headings. Existing KBTD files use named H1 boards and H2 columns; its parser currently recognizes only open/done cards in columns. Preserve both kinds of input without a migration. In particular, retain declined tasks and tasks outside a displayed column verbatim during unrelated edits. Do not insert headings just to render a column, reinterpret declined as blocked, or claim full upstream coverage based only on KBTD-shaped examples.
 
@@ -58,7 +58,22 @@ For each implemented metadata field, exercise **absent → set → replace (wher
 3. **CLI → TUI:** With no TTY, rename only the FAQ's child. Reload the TUI: the guide still has “Review links”. Remove the guide's owner; its title and tag are unchanged.
 4. **TUI → disk:** Cancel deletion of “Publish guide” and compare file bytes. Confirm deletion: the guide and its child disappear, but the FAQ, its renamed child and the entire DONE section remain.
 
-For any approved convention, add a **separate** hand-written fixture with exact before/after bytes. For the chosen `#blocked` tag mapping, marking an open `#docs` task adds only `#blocked`; unmarking restores the original line and the checkbox stays open. Do not simulate a due date or note in this fixture without settling its representation.
+### Descriptions and due dates
+
+```markdown
+- [ ] Publish guide @alice #docs #due-2028-02-29
+  Description: Prepare the release notes.
+  Description: Include the upgrade steps.
+  Keep links relative.
+  - [ ] Review links
+    Description: Check every target.
+```
+
+A description starts immediately below its checkbox, indented two spaces beyond the task line. Each consecutive `Description:` line supplies one line of the value. Use a space after the colon for text or a bare `Description:` for an empty line. The first other line ends the description. Remove all of these leading lines to clear the field. In this example, clearing the guide description preserves “Keep links relative.” and the child's description.
+
+The lowercase `#due-` prefix followed by four-digit year, two-digit month and two-digit day identifies the due tag in the same trailing metadata group as an owner. A field edit requires a single due tag or an undated task. Duplicate date tags can be resolved with a text editor or the raw task editor. Editing or clearing a date changes just that token and its separator. The dedicated editors validate actual calendar dates, including leap years.
+
+The CLI commands `description` and `due` take a section, column and task path. Follow the path with the new value, pass `--clear` to remove it, or omit both to print it. In the TUI, `D` edits a description (Ctrl-N inserts a line break), `u` edits a date and `v` toggles date visibility on cards. Both editors accept Enter to save and Esc to cancel. An empty draft clears the field.
 
 ## 4. Delivery and verification
 
@@ -71,8 +86,8 @@ For any approved convention, add a **separate** hand-written fixture with exact 
 
 | ID | Result | Evidence or remaining decision |
 | --- | --- | --- |
-| F1 · Description | Deferred | `show` / `i` display attached Markdown as-is. A separately editable description needs an agreed representation. |
-| F2 · Due date | Deferred | No approved date representation, so there is no date editor or date-view toggle. |
+| F1 · Description | Passed | `test_description_header_is_scoped_to_one_task` covers hand-written multiline descriptions, carriage returns, children, and neighboring prose. CLI and TUI field tests cover editing and clearing. |
+| F2 · Due date | Passed | `test_description_and_due_cli_on_subtask` and `test_edit_description_due_and_toggle_date_visibility` cover set, replace, clear, invalid dates and the display-only toggle. |
 | F3 · Blocked | Partial | CLI `block` / `unblock` and TUI `B` implement the `#blocked` tag only. See `test_metadata_edits_touch_only_one_suffix_token` and the README board test below. A distinct blocker note remains deferred. |
 | F4 · Owner | Passed | `test_task_paths_and_fields_in_headless_cli` and `test_readme_board_owner_block_hierarchy_and_delete_across_interfaces` cover setting, replacing, inspecting and clearing an owner. |
 | F5 · Subtasks | Passed | Those tests cover child creation, editing and sibling paths; `test_new_actions_cancel_on_reload_and_moves_preserve_the_subtree` covers moving a parent. |

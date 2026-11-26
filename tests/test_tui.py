@@ -2,17 +2,18 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from kbtd.cli import main
 from kbtd.storage import BoardFile, SelectionStore
+from kbtd.watchers import Watchers
 
 try:
     import curses
 except ImportError as e:
     raise unittest.SkipTest("curses unavailable") from e
 
-from kbtd.tui import BoardUI
+from kbtd.tui import BoardUI, _apply_theme
 from kbtd.view import View
 
 
@@ -54,6 +55,84 @@ class TuiTests(unittest.TestCase):
     def open(self):
         return BoardUI(self.source, self.source.load())
 
+    def test_theme_selection_at_tui_launch(self):
+        with (patch("sys.stdin.isatty", return_value=True),
+              patch("sys.stdout.isatty", return_value=True),
+              patch("kbtd.tui.run_tui") as launch,
+              patch.dict(os.environ)):
+            os.environ.pop("KBTD_THEME", None)
+            path = str(self.source.path)
+            for args, env, expected in [
+                ([path], "", "system"),
+                (["-f", path], "vercel-dark", "vercel-dark"),
+                (["tui", path, "--theme", "vercel-light"], "vercel-dark", "vercel-light"),
+            ]:
+                if env:
+                    os.environ["KBTD_THEME"] = env
+                self.assertEqual(main(args), 0)
+                self.assertEqual(launch.call_args.args[-1], expected)
+
+    def test_watcher_events_from_tui_edits(self):
+        self.ui.select(0)
+        with patch("kbtd.storage.Watchers.emit_many") as emit:
+            for key in "oamy\nBu2028-02-29\n  ":
+                self.ui.key(key)
+            events = [call.args[0][0] for call in emit.call_args_list]
+            self.assertEqual([kinds for kinds, _ in events], [
+                ("owner.changed",), ("tags.changed",), ("tags.changed",), ("task.completed",), ("task.reopened",)
+            ])
+            self.assertEqual(events[2][1]["after"]["tags"], ["blocked", "due-2028-02-29"])
+            self.assertTrue(events[3][1]["after"]["done"])
+            self.assertFalse(events[4][1]["after"]["done"])
+            emit.reset_mock()
+            self.ui.key("J")
+            self.source.path.write_text(self.source.path.read_text().replace("@amy", "@bob"))
+            self.assertTrue(self.ui.poll())
+            emit.assert_not_called()
+
+    def test_conditional_watcher_follows_tui_edits_across_columns(self):
+        os.environ.pop("KBTD_JOB_ID", None)  # setUp isolates the environment
+        watchers = Watchers(self.source.path)
+        condition = r'owner.changed = "codex" /\ tags.changed /\ task.status = "Queue"'
+        watchers.add("combined", condition, "exit 0")
+        self.enterContext(patch.object(Watchers, "_start_worker"))
+        self.ui.select(0)
+        for key in "e @codex #docs\n":
+            self.ui.key(key)
+        self.ui.key("L")  # Repeat an edit that changes both fields in Doing.
+        for title in ("first @sam #old", "first @codex #docs"):
+            self.ui.key("e")
+            for _ in self.ui.draft:
+                self.ui.key(curses.KEY_BACKSPACE)
+            for key in title + "\n":
+                self.ui.key(key)
+        self.assertEqual((self.ui.column.name, self.ui.card.text), ("Doing", "first @codex #docs"))
+        self.assertEqual([job["trigger"] for job in watchers.jobs()], [condition])
+
+    def test_theme_palettes_and_terminal_fallbacks(self):
+        screen = Mock()
+        with patch("curses.has_colors", return_value=False):
+            self.assertEqual(_apply_theme(screen, "vercel-light"), curses.A_DIM)
+        screen.bkgd.assert_not_called()
+        with (patch("curses.has_colors", return_value=True),
+              patch("curses.use_default_colors") as defaults,
+              patch("curses.color_pair", side_effect=lambda n: n << 8),
+              patch("curses.init_pair") as init):
+            self.assertEqual(_apply_theme(screen, "system"), curses.A_DIM)
+            defaults.assert_called_once()
+            init.assert_not_called()
+            for theme, fg, bg, muted in [("vercel-light", 16, 231, 241), ("vercel-dark", 231, 16, 247)]:
+                with patch("curses.COLORS", 256, create=True):
+                    self.assertEqual(_apply_theme(screen, theme), 2 << 8)
+                    self.assertEqual(init.call_args_list, [call(1, fg, bg), call(2, muted, bg)])
+                    screen.bkgd.assert_called_with(" ", 1 << 8)
+                    init.reset_mock()
+            with patch("curses.COLORS", 8, create=True):
+                self.assertEqual(_apply_theme(screen, "vercel-light"), curses.A_DIM)
+                init.assert_called_once_with(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+                init.side_effect = curses.error
+                self.assertEqual(_apply_theme(screen, "vercel-dark"), curses.A_DIM)
+
     def test_picker_board_and_keyboard_edits(self):
         ui = self.ui
         self.assertIsNone(ui.board)
@@ -90,6 +169,26 @@ class TuiTests(unittest.TestCase):
         self.assertIsNone(ui.board)
         self.assertFalse(ui.key("q"))
 
+    def test_priority_keys_keep_focus_on_the_moved_subtree(self):
+        original = ("# Alpha\n## Queue\n- [ ] Parent\n  - [ ] First\n  - [ ] Second\n"
+                    "    - [ ] Grandchild\n- [x] Next\n  - [ ] Child of next")
+        self.source.path.write_text(original)
+        ui = self.open()
+        ui.select(0)
+        ui.key("J")
+        self.assertEqual((ui.column.rows[ui.row][0], ui.card.text, ui.row), ("2", "Parent", 2))
+        ui.key("j")
+        ui.key("J")
+        self.assertEqual((ui.column.rows[ui.row][0], ui.card.text, ui.row), ("2.2", "First", 5))
+        with patch.object(self.source, "save", side_effect=AssertionError("boundary move wrote to disk")):
+            ui.key("J")
+        self.assertEqual((ui.card.text, ui.row), ("First", 5))
+        ui.key("K")
+        ui.key("k")
+        ui.key("K")
+        self.assertEqual((ui.card.text, ui.row), ("Parent", 0))
+        self.assertEqual(self.source.path.read_text(), original)
+
     def test_click_and_drag(self):
         ui, view = self.ui, self.view
         view.draw(ui)
@@ -106,6 +205,43 @@ class TuiTests(unittest.TestCase):
         self.assertIn("## Done\n- [x] first\n  hidden notes", self.source.path.read_text())
         ui.mouse(view, 4, 0, curses.BUTTON1_CLICKED)
         self.assertIsNone(ui.board)
+
+    def test_edit_description_due_and_toggle_date_visibility(self):
+        ui = self.ui
+        ui.key("\n")
+        original = self.source.path.read_bytes()
+
+        def replace(key, value):
+            ui.key(key)
+            for _ in ui.draft:
+                ui.key(curses.KEY_BACKSPACE)
+            for ch in value:
+                ui.key("\x0e" if ch == "\n" else ch)
+            ui.key("\n")
+
+        replace("D", "First\nSecond")
+        ui.key("i")
+        self.view.draw(ui)
+        self.assertTrue(any("Description: Second" in text for text, _ in self.screen.entries.values()))
+        ui.key("\x1b")
+        replace("D", "Replacement")
+        ui.key("u")
+        for ch in "2027-02-29\n":
+            ui.key(ch)
+        self.assertEqual(ui.mode, "due")
+        self.assertIn("YYYY-MM-DD", ui.notice)
+        self.assertNotIn(b"#due-", self.source.path.read_bytes())
+        ui.key("\x1b")
+        replace("u", "2028-02-29")
+        replace("u", "2028-03-01")
+        with patch.object(self.source, "save", side_effect=AssertionError("display must not save")):
+            for key, visible in [("", True), ("v", False), ("v", True)]:
+                ui.key(key)
+                self.view.draw(ui)
+                self.assertEqual(any("2028-03-01" in t for t, _ in self.screen.entries.values()), visible)
+        replace("D", "")
+        replace("u", "")
+        self.assertEqual(self.source.path.read_bytes(), original)
 
     def test_restore_by_path_and_name_not_section_index(self):
         ui = self.ui

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from datetime import date
 from functools import cached_property
 from io import StringIO
 
@@ -13,6 +14,8 @@ from io import StringIO
 # A mention in prose, an email, and a fragment in a URL remain ordinary text.
 _META = re.compile(r"[@#][\w-]+")
 _WORD = re.compile(r"[^ \t]+")
+_DUE_TAG = re.compile(r"#due-[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_DESCRIPTION = "Description:"
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,11 @@ class Card:
     end: int  # exclusive; includes attached notes and descendants
     indent: int = 0
     children: tuple[Card, ...] = ()
+    description_lines: tuple[str, ...] = ()
+
+    @property
+    def description(self) -> str:
+        return "\n".join(self.description_lines)
 
     @cached_property
     def metadata(self) -> tuple[re.Match[str], ...]:
@@ -37,12 +45,32 @@ class Card:
     def blocked(self) -> bool:
         return any(m[0] == "#blocked" for m in self.metadata)
 
+    @cached_property
+    def date_tokens(self) -> tuple[re.Match[str], ...]:
+        return tuple(m for m in self.metadata if _DUE_TAG.fullmatch(m[0]))
+
+    @cached_property
+    def text_without_dates(self) -> str:
+        text = self.text
+        for m in reversed(self.date_tokens):
+            start, end = m.span()
+            text = text[:max(0, start - 1)] + text[end:]
+        return text
+
     def field(self, kind: str) -> re.Match[str] | None:
-        matches = [m for m in self.metadata
-                   if (m[0].startswith("@") if kind == "owner" else m[0] == "#blocked")]
+        if kind == "due date":
+            matches = self.date_tokens
+        else:
+            matches = [m for m in self.metadata
+                       if (m[0].startswith("@") if kind == "owner" else m[0] == "#blocked")]
         if len(matches) > 1:
             raise ValueError(f"ambiguous {kind}: edit the task text to resolve duplicate tokens")
         return next(iter(matches), None)
+
+    @property
+    def due(self) -> str:
+        token = self.field("due date")
+        return token[0].removeprefix("#due-") if token else ""
 
 
 @dataclass(frozen=True)
@@ -176,10 +204,59 @@ class Document:
     def set_blocked(self, card: Card, blocked: bool) -> Document:
         return self._field(card, "blocked", "#blocked" if blocked else "")
 
+    def set_due(self, card: Card, value: str | None) -> Document:
+        if value is None:
+            return self._field(card, "due date", "")
+        token = f"#due-{value}"
+        try:
+            if not _DUE_TAG.fullmatch(token):
+                raise ValueError
+            date.fromisoformat(value)
+        except ValueError:
+            raise ValueError("due date must be a valid YYYY-MM-DD calendar date") from None
+        return self._field(card, "due date", token)
+
+    def set_description(self, card: Card, value: str | None) -> Document:
+        value = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+        values = tuple(value.split("\n")) if value else ()
+        if values == card.description_lines:
+            return self
+        start = card.start + 1
+        stop = start + len(card.description_lines)
+        prefix = " " * (card.indent + 2) + _DESCRIPTION
+        ending = _eol(self.lines[card.start])
+        old = self.lines[start:stop]
+        lines = list(self.lines)
+        lines[start:stop] = [prefix + (" " + text if text else "") + (_eol(old[i]) if i < len(old) else ending)
+                             for i, text in enumerate(values)]
+        return self._updated(lines)
+
     def delete(self, card: Card) -> Document:
         lines = list(self.lines)
         del lines[card.start : card.end]
         return self._updated(lines)
+
+    def reorder(self, column: Column, path: str, step: int) -> tuple[Document, str]:
+        """Swap adjacent sibling subtrees and return the selected task's new path."""
+        if step not in (-1, 1):
+            raise ValueError("priority moves must be one position up or down")
+        card = column.resolve(path)
+        parent, separator, number = path.rpartition(".")
+        siblings = column.resolve(parent).children if parent else column.cards
+        target = int(number) + step
+        if not 1 <= target <= len(siblings):
+            return self, path
+
+        neighbor = siblings[target - 1]
+        first, last = (neighbor, card) if step < 0 else (card, neighbor)
+        earlier = self.lines[first.start:first.end]
+        later = list(self.lines[last.start:last.end])
+        if not _eol(later[-1]):
+            # Transfer the separator when moving an unterminated EOF line forward.
+            later[-1] += _eol(earlier[-1])
+        lines = list(self.lines)
+        lines[first.start:last.end] = [*later, *lines[first.end:last.start], *earlier]
+        return self._updated(lines), f"{parent}{separator}{target}"
 
     def move(self, card: Card, target: Column) -> Document:
         if card.indent:
@@ -210,6 +287,17 @@ class _Heading:
 
 def _tree(lines: tuple[str, ...], root: Card) -> Card:
     """Index editable children within a legacy task block, keeping opaque lines intact."""
+    def with_description(card: Card) -> Card:
+        prefix = " " * (card.indent + 2) + _DESCRIPTION
+        values = []
+        for i in range(card.start + 1, root.end):
+            line = lines[i].rstrip("\r\n")
+            if line != prefix and not line.startswith(prefix + " "):
+                break
+            values.append(line[len(prefix):].removeprefix(" "))
+        return replace(card, description_lines=tuple(values)) if values else card
+
+    root = with_description(root)
     stack: list[tuple[Card, list[Card]]] = [(root, [])]
 
     def finish(end: int) -> None:
@@ -239,7 +327,8 @@ def _tree(lines: tuple[str, ...], root: Card) -> Card:
             fence, fence_indent = marker[1], stack[-1][0].indent + 1
         elif (leading == " " * (stack[-1][0].indent + 2)
               and (task := _TASK.fullmatch(content))):
-            stack.append((Card(task[2] or "", task[1] == "x", i, i + 1, indent), []))
+            child = Card(task[2] or "", task[1] == "x", i, i + 1, indent)
+            stack.append((with_description(child), []))
         end = i + 1
     while len(stack) > 1:
         finish(end)

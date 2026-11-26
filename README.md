@@ -1,6 +1,6 @@
 # KBTD — Markdown Kanban in the terminal
 
-KBTD is a Python CLI and curses TUI for Markdown task boards using [TODO.md](https://github.com/todo-md/todo-md) task syntax. Both interfaces edit the Markdown file itself. No database, browser or server is involved.
+KBTD is a Python CLI and curses TUI for Markdown task boards using [TODO.md](https://github.com/todo-md/todo-md) task syntax. Both interfaces edit the Markdown file itself. Optional watchers use a local SQLite queue to run your shell commands after board edits.
 
 ## Quick start
 
@@ -61,8 +61,9 @@ Copy this board into `TODO.md` and open it with `kbtd`:
 ## Release
 
 - [ ] Publish guide @alice #docs
+  Description: Explain how to publish a release.
   Keep links relative.
-  - [ ] Review links
+  - [ ] Review links #due-2028-02-29
 - [ ] Publish FAQ
   - [ ] Review links
 
@@ -78,12 +79,14 @@ Each H1 is a selectable board and each H2 under it a column. KBTD edits open (`-
 | To edit by hand | What to write in `TODO.md` |
 | --- | --- |
 | Assign, change or remove an owner | Add, replace or remove one trailing `@USERNAME`, as in `Publish guide @alice #docs`. |
+| Describe a task or subtask | Put `Description: text` directly below its checkbox, indented two spaces further. Repeat the prefix for each additional line. A bare `Description:` encodes a blank line. Delete the leading description lines to clear the field. |
+| Set or remove a due date | Add, replace or remove a trailing `#due-YYYY-MM-DD` tag. KBTD displays the date on the card. |
 | Mark or unmark as blocked | Add or remove the ordinary tag `#blocked`, e.g. `- [ ] Publish guide @alice #docs #blocked`. KBTD displays **BLOCKED**; other TODO.md clients see a tag. The checkbox is unchanged. |
 | Add, edit or delete a subtask | Add a checkbox line indented **two more spaces** than its parent. Edit its text in place. To delete, remove its line and attached subtree, not adjacent siblings. |
 
 Put editable metadata together at the end of the task line, separated by spaces or tabs. Token names use letters, digits, underscores and hyphens. KBTD does not edit mentions inside prose or URLs. The blocked tag is case-sensitive. If the trailing group contains multiple owners or duplicate blocked tags, resolve that field by editing the line rather than having KBTD choose for you.
 
-Other indented text is ordinary Markdown. It travels with its task and can be read with `i` or `kbtd show`. No typed description, due date or separate blocker-note syntax is defined. Preambles, fenced examples and unrelated prose stay in the file. Edit headings by hand to create or rename boards and columns.
+The description prefix and due-date tag are KBTD conventions. Other indented text travels with its task and can be read with `i` or `kbtd show`. Preambles, fenced examples and unrelated prose stay in the file. Edit headings by hand to create or rename boards and columns.
 
 ## CLI
 
@@ -91,14 +94,18 @@ The default file is `./TODO.md`. Use `-f PATH` / `--file PATH` to use a differen
 
 ```text
 kbtd init [PATH]                      Create Tasks with Backlog, In Progress, Done
-kbtd tui [PATH]                       Open the section picker or last selected board
+kbtd tui [--theme THEME] [PATH]       Open the section picker or last selected board
 kbtd list [SECTION [COLUMN]]          List numbered sections, columns and cards
 kbtd add SECTION COLUMN TEXT          Append an unchecked card
 kbtd toggle SECTION COLUMN CARD       Toggle completion
 kbtd move SECTION COLUMN CARD TARGET  Append card to TARGET in the same section
+kbtd up SECTION COLUMN CARD           Raise a task or subtask one place among siblings
+kbtd down SECTION COLUMN CARD         Lower a task or subtask one place among siblings
 kbtd edit SECTION COLUMN CARD TEXT    Replace task-line text, including any inline tokens
 kbtd subtask SECTION COLUMN CARD TEXT Append a child to CARD
 kbtd owner SECTION COLUMN CARD USER   Set or replace owner (or use --clear instead of USER)
+kbtd description SECTION COLUMN CARD [TEXT | --clear]  Read, set or clear a description
+kbtd due SECTION COLUMN CARD [YYYY-MM-DD | --clear]    Read, set or clear a calendar date
 kbtd block SECTION COLUMN CARD        Add the #blocked tag
 kbtd unblock SECTION COLUMN CARD      Remove the #blocked tag
 kbtd show SECTION COLUMN CARD         Print the task and its attached Markdown
@@ -123,6 +130,17 @@ kbtd delete TODO Release 1.2
 
 The board shows columns side by side, with cards stacked inside them. A narrow terminal shows a window of columns that follows the selection. Completed cards have an `[x]` and muted text.
 
+The default `system` theme follows your terminal’s foreground and background. Use `--theme` for one session, or set `KBTD_THEME` in your shell profile to choose a default for all boards. The flag takes precedence.
+
+```sh
+kbtd tui --theme vercel-light       # dark text on white
+export KBTD_THEME=vercel-dark       # white text on black
+kbtd                                # use the shell preference
+kbtd tui --theme system             # use terminal colors for this session
+```
+
+Both Vercel themes use gray for secondary text on 256-color terminals. Basic color terminals use their black and white palette. Monochrome terminals retain selection and completion cues through reverse video and checkboxes.
+
 | Key / gesture | Action |
 | --- | --- |
 | ↑/↓ or `k`/`j` | Select a board in the picker, or a card in a column |
@@ -130,17 +148,59 @@ The board shows columns side by side, with cards stacked inside them. A narrow t
 | ←/→ or `h`/`l` | Focus a column |
 | Space / click card | Toggle completion |
 | `H`/`L` or `<`/`>` | Move a root task and its subtree to the previous/next column |
+| `K` / `J` | Raise / lower the selected task or subtask one place among its siblings. Its notes, descendants and selection move with it. |
 | Drag card to another column | Append the root and its subtree to that column (mouse-capable terminals) |
 | `a` / `e` | Add a card / edit its text; Enter saves, Esc cancels |
 | `s` | Add a child to the selected task; Enter saves, Esc cancels |
 | `o` | Edit the owner; save an empty value to clear |
+| `D` | Edit the description. Ctrl-N inserts a line break, Enter saves, Esc cancels. An empty draft clears it. |
+| `u` / `v` | Edit the due date / toggle date visibility for this session. Enter saves the date. An empty draft clears it. |
 | `B` | Mark or unmark the selected task as blocked |
 | `i` | Inspect the selected Markdown subtree, including notes; ↑/↓ scroll, Esc returns |
 | `d` | Delete selected task, its descendants and notes after confirmation |
 | `b` / Esc / click `[Boards]` | Return to the section picker |
 | `?` / `q` | Show shortcuts / quit |
 
-Edits replace the file atomically, then re-read it. The TUI checks for external changes every 250 ms. Changes reload the board and cancel pending input; if its H1 disappears, you return to the picker. There is no merge or locking: concurrent saves are last-write-wins. Only the selected section is remembered between sessions, keyed by the absolute Markdown path under `$XDG_STATE_HOME/kbtd` (default `~/.local/state/kbtd`).
+Edits replace the file atomically, then re-read it. The TUI checks for external changes every 250 ms. Changes reload the board and cancel pending input; if its H1 disappears, you return to the picker. There is no merge or locking: concurrent saves are last-write-wins. The selected section is remembered between sessions, keyed by the absolute Markdown path under `$XDG_STATE_HOME/kbtd` (default `~/.local/state/kbtd`).
+
+## Watchers
+
+A watcher runs a shell command in the board file’s directory when a KBTD edit triggers it. Definitions apply to every section of that file and belong to the user who registered them. Register a command once from the CLI. Edits from the CLI and TUI can both trigger it.
+
+This example records assignments in a local log on a fresh board.
+
+```sh
+kbtd init
+kbtd add Tasks Backlog "Publish the guide"
+kbtd watch add log-owners owner.changed 'printf "%s\n" "$KBTD_EVENT" >> assignments.jsonl'
+kbtd owner Tasks Backlog 1 alice
+kbtd watch jobs
+```
+
+`watch jobs` shows the job ID, watcher, trigger, status, attempt and result. Once the job succeeds, `assignments.jsonl` contains a JSON event with the task path and the owners before and after the edit. The board command returns while the action runs in the background.
+
+| Trigger | When it fires on an existing task or subtask |
+| --- | --- |
+| `owner.changed` | An owner is assigned, replaced or cleared. |
+| `tags.changed` | The set of trailing tags changes. This includes `#blocked` and due-date tags. |
+| `task.completed` | The checkbox changes from open to done. |
+| `task.reopened` | The checkbox changes from done to open. |
+
+To log assignments to Codex in Backlog, pass the whole condition as one shell argument.
+
+```sh
+kbtd watch add codex-backlog 'owner.changed = "codex" /\ task.status = "Backlog"' 'printf "%s\n" "$KBTD_EVENT" >> codex.jsonl'
+```
+
+An event name tests whether that change happened in this edit. `owner.changed = "codex"` also requires the resulting owners to include `codex`. `tags.changed = "docs"` works the same way for tags. Omit `@` and `#` in these values. Completion events accept `TRUE` or `FALSE` for the resulting checkbox. `task.status = "Backlog"` checks the exact column name. String comparisons are case-sensitive and use JSON double quotes.
+
+Combine predicates with `~` (not), `/\` (and) and `\/` (or), in that order of precedence. Parentheses group alternatives. For example, `(owner.changed \/ tags.changed) /\ task.status = "In Progress"` runs once for an edit in that column even if it changes both fields. Each edit is evaluated independently. Conditions run only on edits that emit at least one event in the table above.
+
+For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KBTD_EVENT.events` in the JSON payload lists the event names from the edit.
+
+Raw title edits can trigger owner and tag changes. Creating, moving or reordering a card, saving an unchanged value, and reloading an external edit produce no events. Watcher actions that call KBTD inherit a job ID that suppresses nested dispatch.
+
+Use `kbtd watch list` to see definitions, `kbtd watch remove NAME` to stop future matches, and `kbtd watch retry ID` to rerun a failed or interrupted job. A retry can repeat a shell side effect. The [watcher decision and event contract](docs/adr/0001-board-watchers.md) covers recovery, environment variables and the runner choice.
 
 ## Publishing a mise release
 

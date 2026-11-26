@@ -1,24 +1,34 @@
 """Command-line interface shared by the console script and python -m kbtd."""
 
 import argparse
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from . import watch_cli
+from .events import edit_events
 from .markdown import Column, Document, Section
 from .storage import BoardFile
+
+THEMES = ("system", "vercel-light", "vercel-dark")
 
 COMMANDS = {
     "tui": "open the interactive Kanban board (default)",
     "init": "create a starter board; never overwrite a file",
     "list": "list boards, columns and numbered cards",
+    "watch": "configure background shell actions and inspect their jobs",
     "add": "append an unchecked card",
     "subtask": "append an unchecked child to the selected task",
     "show": "print the selected task and its attached Markdown",
     "owner": "set the task owner, or remove it with --clear",
+    "description": "print or edit a task description, or remove it with --clear",
+    "due": "print or set a calendar due date, or remove it with --clear",
     "block": "mark a task with the #blocked tag",
     "unblock": "remove the #blocked tag",
     "toggle": "toggle a card's checkbox",
+    "up": "move a task and its subtree one place up among its siblings",
+    "down": "move a task and its subtree one place down among its siblings",
     "move": "append a root task and its whole subtree to another column",
     "edit": "replace task-line text including inline tags/owner; keep children and notes",
     "delete": "delete this task, all its descendants and attached notes (no prompt)",
@@ -36,6 +46,11 @@ def _parser() -> argparse.ArgumentParser:
     subs = parser.add_subparsers(dest="command", metavar="COMMAND")
     for command, help_text in COMMANDS.items():
         sub = subs.add_parser(command, help=help_text, description=help_text, parents=[common])
+        if command == "watch":
+            watch_cli.add_arguments(sub, common)
+            continue
+        if command == "tui":
+            sub.add_argument("--theme", choices=THEMES, help="color theme (default: KBTD_THEME or system)")
         if command in ("tui", "init"):
             sub.add_argument("path", type=Path, nargs="?", help="Markdown file (instead of -f)")
             continue
@@ -50,6 +65,11 @@ def _parser() -> argparse.ArgumentParser:
             who = sub.add_mutually_exclusive_group(required=True)
             who.add_argument("username", nargs="?", help="username with or without @")
             who.add_argument("--clear", action="store_true", help="remove the owner")
+        if command in ("description", "due"):
+            field = sub.add_mutually_exclusive_group()
+            help_text = "description text (quote spaces)" if command == "description" else "calendar date YYYY-MM-DD"
+            field.add_argument("value", nargs="?", help=help_text + "; omit to print the current value")
+            field.add_argument("--clear", action="store_true", help="remove this field")
         if command in ("add", "edit", "subtask"):
             sub.add_argument("text", help="one line of task text (quote spaces)")
     return parser
@@ -84,21 +104,22 @@ def _listing(doc: Document, section: str | None, column: str | None) -> None:
                 print(f"     {' ' * card.indent}{path}. [{'x' if card.done else ' '}] {card.text}")
 
 
-def _column(doc: Document, args: argparse.Namespace) -> Column:
-    board = doc.sections[_index(doc.sections, args.section, "section")]
-    return board.columns[_index(board.columns, args.column, "column")]
-
-
-def _change(doc: Document, args: argparse.Namespace) -> Document:
-    column = _column(doc, args)
+def _change(doc: Document, args: argparse.Namespace, board: Section, column: Column) -> Document:
     if args.command == "add":
         return doc.add(column, args.text)
+    if args.command in ("up", "down"):
+        changed, _ = doc.reorder(column, args.card, -1 if args.command == "up" else 1)
+        return changed
     card = column.resolve(args.card)
     match args.command:
         case "subtask":
             return doc.add_child(card, args.text)
         case "owner":
             return doc.set_owner(card, args.username)
+        case "description":
+            return doc.set_description(card, args.value)
+        case "due":
+            return doc.set_due(card, args.value)
         case "block" | "unblock":
             return doc.set_blocked(card, args.command == "block")
         case "edit":
@@ -108,10 +129,35 @@ def _change(doc: Document, args: argparse.Namespace) -> Document:
         case "toggle":
             return doc.toggle(card)
         case "move":
-            board = doc.sections[_index(doc.sections, args.section, "section")]
             return doc.move(card, board.columns[_index(board.columns, args.target, "column")])
         case _:
             raise AssertionError(args.command)
+
+
+def _task_command(source: BoardFile, doc: Document, args: argparse.Namespace) -> None:
+    s = _index(doc.sections, args.section, "section")
+    board = doc.sections[s]
+    c = _index(board.columns, args.column, "column")
+    column = board.columns[c]
+    if args.command == "show":
+        card = column.resolve(args.card)
+        sys.stdout.write("".join(doc.lines[card.start:card.end]))
+        return
+    if args.command in ("description", "due") and args.value is None and not args.clear:
+        card = column.resolve(args.card)
+        value = card.description if args.command == "description" else card.due
+        if value:
+            print(value)
+        return
+    changed = _change(doc, args, board, column)
+    if changed is doc:
+        return
+    events = []
+    if args.command in ("toggle", "owner", "edit", "block", "unblock", "due"):
+        events = edit_events(doc, changed, s, c, args.card)
+    saved = source.save(changed, events)
+    if saved.watcher_warning:
+        raise RuntimeError(saved.watcher_warning)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -129,6 +175,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             source.create()
             print(f"Created {source.path}")
             return 0
+        if args.command == "watch":
+            if args.watch_command == "add":
+                source.load()
+            watch_cli.manage(source.path, args)
+            return 0
         snapshot = source.load()
         if args.command in (None, "tui"):
             if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -139,17 +190,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if e.name not in ("curses", "_curses"):
                     raise
                 raise RuntimeError("the TUI needs Python curses support (on Windows, install windows-curses)") from e
-            run_tui(source, snapshot)
+            theme = getattr(args, "theme", None) or os.environ.get("KBTD_THEME") or "system"
+            if theme not in THEMES:
+                raise ValueError(f"invalid KBTD_THEME {theme!r}; choose from {', '.join(THEMES)}")
+            run_tui(source, snapshot, theme)
         elif args.command == "list":
             _listing(snapshot.document, args.section, args.column)
-        elif args.command == "show":
-            doc = snapshot.document
-            card = _column(doc, args).resolve(args.card)
-            sys.stdout.write("".join(doc.lines[card.start:card.end]))
         else:
-            changed = _change(snapshot.document, args)
-            if changed is not snapshot.document:
-                source.save(changed)
+            _task_command(source, snapshot.document, args)
         return 0
     except FileNotFoundError as e:
         print(f"kbtd: {e}. Use 'kbtd init' to create a new board.", file=sys.stderr)

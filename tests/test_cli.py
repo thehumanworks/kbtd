@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import stat
 import tempfile
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from kbtd.cli import main
 from kbtd.storage import BoardFile
+from kbtd.watchers import Watchers
 
 
 class CliTests(unittest.TestCase):
@@ -49,6 +51,32 @@ class CliTests(unittest.TestCase):
             self.assertIn("Backlog", self.cli("list"))
             self.assertIn("interactive terminal", self.cli(ok=False))
             self.assertIn("interactive terminal", self.cli("TODO.md", ok=False))
+
+    def test_priority_moves_swap_root_and_child_subtrees_in_place(self):
+        path = str(self.file)
+        header = b"# Board\n## Queue\r\n"
+        parent = b"- [ ] Parent\r\n"
+        first = b"  - [ ] Same @ada\r\n    child note\r\n    - [x] Grandchild\r\n"
+        between = b"\r\n  parent note\r\n  - [-] declined\r\n"
+        second = b"  - [x] Same #docs\r\n"
+        gap = b"\r\ncolumn prose\r\n"
+        other = b"- [x] Other"
+        original = header + parent + first + between + second + gap + other
+        self.file.write_bytes(original)
+
+        self.cli("-f", path, "up", "Board", "Queue", "1.2")
+        swapped = parent + second + between + first
+        self.assertEqual(self.file.read_bytes(), header + swapped + gap + other)
+        self.assertIn("1.2.1. [x] Grandchild", self.cli("-f", path, "list"))
+
+        self.cli("-f", path, "down", "1", "1", "1")
+        self.assertEqual(self.file.read_bytes(), header + other + b"\r\n" + gap + swapped.rstrip(b"\r\n"))
+        with patch.object(BoardFile, "save", side_effect=AssertionError("boundary move wrote to disk")):
+            for direction, task in [("up", "1"), ("down", "2"), ("down", "2.2"), ("up", "2.2.1")]:
+                self.cli("-f", path, direction, "1", "1", task)
+        self.cli("-f", path, "up", "1", "1", "2")
+        self.cli("-f", path, "down", "1", "1", "1.1")
+        self.assertEqual(self.file.read_bytes(), original)
 
     def test_failed_commands_leave_file_untouched(self):
         path = str(self.file)
@@ -129,3 +157,101 @@ class CliTests(unittest.TestCase):
                 with patch.object(BoardFile, "save", side_effect=AssertionError("unexpected write")):
                     self.assertTrue(self.cli("-f", str(self.file), cmd, "1", "1", path, *args, ok=False))
                 self.assertEqual(self.file.read_bytes(), original)
+
+    def test_description_and_due_cli_on_subtask(self):
+        original = b"# TODO\r\n## C\r\n- [ ] Parent\r\n  - [x] Child #docs\r\n    old note"
+        self.file.write_bytes(original)
+
+        def run(command, *values, ok=True):
+            return self.cli("-f", str(self.file), command, "1", "C", "1.1", *values, ok=ok)
+
+        self.assertEqual(run("due"), "")
+        self.assertEqual(run("description"), "")
+        run("description", "Day one\n\nDay two")
+        run("due", "2028-02-29")
+        self.assertEqual(run("due"), "2028-02-29\n")
+        self.assertEqual(run("description"), "Day one\n\nDay two\n")
+        self.assertIn("    Description: Day one\r\n    Description:\r\n    Description: Day two", run("show"))
+        with patch.object(BoardFile, "save", side_effect=AssertionError("unexpected write")):
+            for bad in ("2027-02-29", "2028-04-31", "20280229", "2028-W09-2", "2028-2-29"):
+                self.assertIn("YYYY-MM-DD", run("due", bad, ok=False))
+            run("due", "2028-02-29")
+            run("description", "Day one\n\nDay two")
+        run("due", "2028-03-01")
+        run("description", "Done")
+        run("due", "--clear")
+        run("description", "--clear")
+        self.assertEqual(self.file.read_bytes(), original)
+        duplicate = original.replace(b"#docs", b"#docs #due-2028-01-01 #due-2029-01-01")
+        self.file.write_bytes(duplicate)
+        self.assertIn("ambiguous due date", run("due", "--clear", ok=False))
+        self.assertEqual(self.file.read_bytes(), duplicate)
+
+    def test_watch_registration_and_cli_edit_events(self):
+        self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
+        path = str(self.file)
+        self.file.write_text("# Tasks\n## Work\n- [ ] Parent\n  - [ ] Child @sam #docs\n")
+        self.cli("watch", "add", "record", "owner.changed", "exit 0", "-f", path)
+        self.assertIn("record\towner.changed\texit 0", self.cli("-f", path, "watch", "list"))
+        with patch("kbtd.storage.Watchers.emit_many") as emit:
+            self.cli("-f", path, "edit", "Tasks", "Work", "1.1", "Child @lee #docs #review")
+            self.assertEqual(emit.call_count, 1)
+            [(kinds, event)] = emit.call_args.args[0]
+            self.assertEqual(kinds, ("owner.changed", "tags.changed"))
+            self.assertEqual((event["section"], event["column"], event["path"]), ("Tasks", "Work", "1.1"))
+            self.assertEqual(event["before"]["owners"], ["sam"])
+            self.assertEqual(event["after"]["owners"], ["lee"])
+            self.assertEqual(event["after"]["tags"], ["docs", "review"])
+            self.cli("-f", path, "edit", "Tasks", "Work", "1.1", "Reworded #review @lee #docs")
+            self.cli("-f", path, "owner", "Tasks", "Work", "1.1", "lee")
+            emit.assert_called_once()
+        self.cli("-f", path, "watch", "remove", "record")
+        self.assertIn("No watchers", self.cli("watch", "-f", path, "list"))
+
+    def test_watchers_only_dispatch_after_save_and_report_queue_errors(self):
+        self.file.write_text("# Tasks\n## Work\n- [ ] Intro\n")
+        command = ("-f", str(self.file), "toggle", "1", "1", "1")
+        with patch("kbtd.storage.Watchers.emit_many", side_effect=RuntimeError("queue unavailable")) as emit:
+            with patch("kbtd.storage._atomic_write", side_effect=OSError("write failed")):
+                self.assertIn("write failed", self.cli(*command, ok=False))
+                emit.assert_not_called()
+            self.assertIn("Board saved. Watcher dispatch failed", self.cli(*command, ok=False))
+            self.assertIn("- [x] Intro", self.file.read_text())
+
+    def test_conditional_watchers_match_once_per_saved_edit_on_the_selected_card(self):
+        self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
+        os.environ.pop("KBTD_JOB_ID", None)
+        self.enterContext(patch.object(Watchers, "_start_worker"))
+        path = str(self.file)
+        self.file.write_text("# Tasks\n## Backlog\n- [ ] Parent\n  - [ ] Child\n## In Progress\n")
+        watchers = Watchers(self.file)
+        together = r'owner.changed /\ tags.changed'
+        either = r'owner.changed = "codex" \/ tags.changed = "docs"'
+        assigned = r'owner.changed = "codex" /\ task.status = "Backlog"'
+        for name, condition in [("both", together), ("either", either), ("assign", assigned),
+                                ("z-owner", "owner.changed"), ("a-tags", "tags.changed")]:
+            self.cli("-f", path, "watch", "add", name, condition, "exit 0")
+        self.assertIn(assigned, self.cli("-f", path, "watch", "list"))
+        self.assertIn("double-quoted", self.cli("-f", path, "watch", "add", "bad",
+                                                "task.status = Backlog", "exit 1", ok=False))
+
+        # Neither different cards nor successive saves on a single card can
+        # satisfy a conjunction of two events.
+        self.cli("-f", path, "owner", "1", "1", "1", "someone")
+        self.cli("-f", path, "block", "1", "1", "1.1")
+        self.cli("-f", path, "owner", "1", "1", "1.1", "sam")
+        self.cli("-f", path, "edit", "1", "1", "1.1", "Child @codex #docs")
+        self.cli("-f", path, "owner", "1", "1", "1.1", "codex")  # no-op
+        self.cli("-f", path, "move", "1", "1", "1", "In Progress")
+        self.cli("-f", path, "owner", "1", "2", "1.1", "--clear")
+        self.cli("-f", path, "owner", "1", "2", "1.1", "codex")
+        jobs = list(reversed(watchers.jobs()))
+        self.assertEqual([job["name"] for job in jobs], [
+            "z-owner", "a-tags", "z-owner", "z-owner", "a-tags", "assign", "both", "either",
+            "z-owner", "z-owner", "either",
+        ])
+        with watchers._database() as db:
+            event = json.loads(db.execute("SELECT event FROM jobs WHERE name = 'both'").fetchone()[0])
+        self.assertEqual((event["events"], event["trigger"], event["column"], event["path"]),
+                         (["owner.changed", "tags.changed"], together, "Backlog", "1.1"))
+        self.assertEqual(event["after"]["owners"], ["codex"])
