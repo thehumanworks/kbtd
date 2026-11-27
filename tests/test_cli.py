@@ -218,6 +218,35 @@ class CliTests(unittest.TestCase):
             self.assertIn("Board saved. Watcher dispatch failed", self.cli(*command, ok=False))
             self.assertIn("- [x] Intro", self.file.read_text())
 
+    def test_moving_a_card_emits_a_status_change(self):
+        self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
+        os.environ.pop("KBTD_JOB_ID", None)
+        self.enterContext(patch.object(Watchers, "_start_worker"))
+        path = str(self.file)
+        self.file.write_text("# Tasks\n## Backlog\n- [ ] Ship @sam\n  - [ ] Child\n## Done\n- [x] Old\n")
+        for name, condition in [("into-done", 'task.status.changed_to == "Done"'),
+                                ("out-of-backlog", 'task.status.changed_from == "Backlog"'),
+                                ("any-move", "task.status.changed"), ("in-done", 'task.status == "Done"'),
+                                ("into-backlog", 'task.status.changed_to == "Backlog"')]:
+            self.cli("-f", path, "watch", "add", name, condition, "exit 0")
+        watchers = Watchers(self.file)
+        self.cli("-f", path, "move", "1", "1", "1", "Done")
+        jobs = watchers.jobs()
+        self.assertEqual(sorted(job["name"] for job in jobs), ["any-move", "in-done", "into-done", "out-of-backlog"])
+        [job] = [job for job in jobs if job["name"] == "into-done"]
+        event = watchers.job(job["id"])["event"]
+        self.assertEqual((event["column"], event["column_number"], event["path"], event["events"]),
+                         ("Done", 2, "2", ["task.status.changed"]))
+        self.assertEqual((event["before"]["status"], event["after"]["status"], event["after"]["owners"]),
+                         ("Backlog", "Done", ["sam"]))
+        # No status change: a move within the column, a refused subtask move, an edit in Done.
+        self.cli("-f", path, "move", "1", "2", "2", "Done")
+        self.assertIn("top-level task", self.cli("-f", path, "move", "1", "2", "2.1", "Backlog", ok=False))
+        self.cli("-f", path, "toggle", "1", "2", "2")
+        names = [job["name"] for job in watchers.jobs()]
+        self.assertEqual(len(names), 5)
+        self.assertEqual(names[0], "in-done")
+
     def test_invalid_stored_trigger_is_reported_and_skipped(self):
         self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
         os.environ.pop("KBTD_JOB_ID", None)

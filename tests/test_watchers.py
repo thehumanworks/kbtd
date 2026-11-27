@@ -20,46 +20,52 @@ from kbtd.watchers import MAX_RECOVERIES, SkippedWatchers, Watchers
 DEADLINE = 20  # seconds; each worker start imports and launches DBOS
 
 
-EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened")
+EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened", "task.status.changed")
 NAMES = ["codex", "Codex", "a b", 'q"x', "back\\slash", "ü", ""]
 COLUMNS = ["Backlog", "In Progress", 'Review "A" / B']
 
 
 def random_condition(rng, depth):
-    """A random condition as (Python source, reference evaluator)."""
+    """A random condition as (Python source, reference evaluator of one edit's state)."""
     if depth == 0 or rng.random() < 0.3:
-        match rng.randrange(6):
+        match rng.randrange(8):
             case 0:
                 event = rng.choice(EVENTS)
-                return event, lambda kinds, after, column: event in kinds
+                return event, lambda s: event in s["kinds"]
             case 1:
                 field, name = rng.choice(["owners", "tags"]), rng.choice(NAMES)
                 op = rng.choice(["in", "not in"])
                 return (f"{json.dumps(name)} {op} task.{field}",
-                        lambda kinds, after, column: (name in after[field]) == (op == "in"))
+                        lambda s: (name in s["after"][field]) == (op == "in"))
             case 2:
                 column, op = rng.choice(COLUMNS), rng.choice(["==", "!="])
-                return (f"task.status {op} {json.dumps(column)}",
-                        lambda kinds, after, column_now: (column_now == column) == (op == "=="))
+                return f"task.status {op} {json.dumps(column)}", lambda s: (s["column"] == column) == (op == "==")
             case 3:
                 options = rng.sample(COLUMNS, 2)
-                return (f"task.status in {json.dumps(options)}",
-                        lambda kinds, after, column: column in options)
+                return f"task.status in {json.dumps(options)}", lambda s: s["column"] in options
             case 4:
-                return "task.done", lambda kinds, after, column: after["done"]
-            case _:
+                return "task.done", lambda s: s["after"]["done"]
+            case 5:
                 field = rng.choice(["owners", "tags"])
-                return f"task.{field}", lambda kinds, after, column: bool(after[field])
+                return f"task.{field}", lambda s: bool(s["after"][field])
+            case 6:
+                column = rng.choice(COLUMNS)
+                return (f"task.status.changed_to == {json.dumps(column)}",
+                        lambda s: "task.status.changed" in s["kinds"] and s["column"] == column)
+            case _:
+                options = rng.sample(COLUMNS, 2)
+                return (f"task.status.changed_from in {json.dumps(options)}",
+                        lambda s: "task.status.changed" in s["kinds"] and s["before"] in options)
     op = rng.choice(["and", "or", "not"])
     if op == "not":
         text, inner = random_condition(rng, depth - 1)
-        return f"not ({text})", lambda *args: not inner(*args)
+        return f"not ({text})", lambda s: not inner(s)
     (left_text, left), (right_text, right) = random_condition(rng, depth - 1), random_condition(rng, depth - 1)
     space = rng.choice([" ", "  ", "\t"])
     text = f"({left_text}){space}{op}{space}({right_text})"
     if op == "and":
-        return text, lambda *args: left(*args) and right(*args)
-    return text, lambda *args: left(*args) or right(*args)
+        return text, lambda s: left(s) and right(s)
+    return text, lambda s: left(s) or right(s)
 
 
 class TriggerTests(unittest.TestCase):
@@ -99,6 +105,24 @@ class TriggerTests(unittest.TestCase):
                 self.assertEqual(compile_trigger(expr)(kinds, payload), expected)
         self.assertFalse(compile_trigger('"codex" in task.owners or task.done')((), {}))
 
+    def test_status_change_names_match_only_moves(self):
+        moved = (("task.status.changed",), {"column": "Done", "before": {"status": "Backlog"},
+                                            "after": {"status": "Done"}})
+        edited = (("owner.changed",), {"column": "Done", "before": {"status": "Done"}, "after": {"status": "Done"}})
+        for expr, on_move, on_edit in [
+            ("task.status.changed", True, False),
+            ('task.status.changed_to == "Done"', True, False),
+            ('"Done" == task.status.changed_to', True, False),
+            ('task.status.changed_from == "Backlog"', True, False),
+            ('task.status.changed_from in ["Backlog", "Ready"]', True, False),
+            ('task.status.changed and not task.status.changed_to == "Done"', False, False),
+            ('not task.status.changed_from == "Backlog"', False, True),
+            ('task.status == "Done"', True, True),  # the column now, whatever changed
+        ]:
+            with self.subTest(expr=expr):
+                self.assertEqual(compile_trigger(expr)(*moved), on_move)
+                self.assertEqual(compile_trigger(expr)(*edited), on_edit)
+
     def test_matches_a_reference_evaluator_on_random_conditions(self):
         rng = random.Random(20261126)
         for _ in range(3000):
@@ -106,10 +130,11 @@ class TriggerTests(unittest.TestCase):
             kinds = tuple(event for event in EVENTS if rng.random() < 0.5)
             after = {"owners": rng.sample(NAMES, rng.randrange(3)), "tags": rng.sample(NAMES, rng.randrange(3)),
                      "done": rng.random() < 0.5}
-            column = rng.choice(COLUMNS)
-            with self.subTest(text=text, kinds=kinds, after=after, column=column):
-                self.assertEqual(compile_trigger(text)(kinds, {"column": column, "after": after}),
-                                 reference(kinds, after, column))
+            column, before = rng.choice(COLUMNS), rng.choice(COLUMNS)
+            payload = {"column": column, "before": {"status": before}, "after": {**after, "status": column}}
+            state = {"kinds": kinds, "after": after, "column": column, "before": before}
+            with self.subTest(text=text, state=state):
+                self.assertEqual(compile_trigger(text)(kinds, payload), reference(state))
 
     def test_mistakes_are_rejected_with_a_reason(self):
         for expr, reason in [
@@ -133,6 +158,12 @@ class TriggerTests(unittest.TestCase):
             ("().__class__", "only event names and task fields"),
             ("[x for x in task.tags]", "ListComp expressions"),
             ("owner.changed\nand tags.changed", "wrap a trigger that spans lines in parentheses"),
+            ('task.status.changed_to = "Done"', "compare with =="),
+            ('task.status.changed_to != "Done"', "would also match edits that are not moves"),
+            ('task.status.changed_from not in ["Backlog"]', "would also match edits that are not moves"),
+            ("task.status.changed_to", "use task.status.changed to test for a move"),
+            ('"Do" in task.status.changed_to', "compare a moved column"),
+            ("task.status.changes_to", "did you mean 'task.status.changed_to'"),
             ("not " * 100 + "owner.changed", "nested too deeply"),
             ("(" * 300 + "owner.changed" + ")" * 300, "too many nested parentheses"),
             ("owner.changed or " * 400 + "tags.changed", "at most 4096 characters"),

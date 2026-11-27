@@ -4,7 +4,7 @@ import curses
 import time
 from collections.abc import Sequence
 
-from .events import Event, edit_events
+from .events import Event, edit_events, move_events
 from .markdown import Card, Column, Document, Section
 from .storage import BoardFile, SectionKey, SelectionStore, Snapshot
 from .view import View
@@ -241,12 +241,15 @@ class BoardUI:
         board = self.board
         if board is None or not 0 <= dest < len(board.columns) or dest == source:
             return
-        _, card = board.columns[source].rows[row]
+        path, card = board.columns[source].rows[row]
         if card.indent:
             self.notice = "Move the top-level task to move its subtree"
             return
+        assert self.section is not None
         target = board.columns[dest]
-        if self._save(self.doc.move(card, target)):
+        moved = self.doc.move(card, target)
+        events = [] if moved is self.doc else move_events(self.doc, moved, self.section, source, path, dest)
+        if self._save(moved, events):
             self.col, self.row = dest, len(target.rows)
             self._fit()
 

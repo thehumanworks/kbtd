@@ -186,6 +186,7 @@ kbtd watch jobs
 | `tags.changed` | The set of trailing tags changes. This includes `#blocked` and due-date tags. |
 | `task.completed` | The checkbox changes from open to done. |
 | `task.reopened` | The checkbox changes from done to open. |
+| `task.status.changed` | The task moves to another column: `kbtd move`, `H`/`L`, `<`/`>` or a drag in the TUI. Its subtasks move with it but emit nothing. |
 
 To log assignments to Codex in Backlog, pass the whole condition as one shell argument.
 
@@ -197,8 +198,9 @@ A condition is a Python expression. KBTD reads it with Python's own parser and e
 
 | Name | Type | Value |
 | --- | --- | --- |
-| `owner.changed`, `tags.changed`, `task.completed`, `task.reopened` | boolean | Whether this edit emitted that event |
+| `owner.changed`, `tags.changed`, `task.completed`, `task.reopened`, `task.status.changed` | boolean | Whether this edit emitted that event |
 | `task.status` | string | Column name after the edit |
+| `task.status.changed_from`, `task.status.changed_to` | string or `None` | Column before / after a move. `None` when the edit did not move the task. |
 | `task.section` | string | Board (H1) name |
 | `task.text` | string | Task-line text after the edit |
 | `task.done` | boolean | Checkbox after the edit |
@@ -208,13 +210,15 @@ Combine conditions with `and`, `or`, `not` and parentheses. Compare with `==`, `
 
 `kbtd watch add` rejects a condition that cannot do what it says: an unknown name (`task.owner`), a comparison of different types (`task.owners == "codex"`), or a fixed value used as a condition (`owner.changed and "codex"`). The error names the part to fix.
 
+`task.status.changed_to == "Done"` matches only the move into Done, and `task.status.changed_from == "Backlog"` only a move out of Backlog. `task.status == "Done"` matches any event-emitting edit of a task that is now in Done. Because the move names are `None` without a move, `!=` and `not in` on them would also match every other edit, so KBTD refuses them. For "moved, but not into Done", write `task.status.changed and not task.status.changed_to == "Done"`.
+
 For example, `(owner.changed or tags.changed) and task.status == "In Progress"` runs once for an edit in that column, even if the edit changes both fields. Each edit is evaluated independently. Conditions run only on edits that emit at least one event in the table above.
 
 Earlier versions used `/\`, `\/`, `~` and `=`. A watcher saved with that syntax no longer runs. `kbtd watch list` names it, and edits report that it was skipped. Remove it and register it again in the new syntax.
 
 For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KBTD_EVENT.events` in the JSON payload lists the event names from the edit.
 
-Raw title edits can trigger owner and tag changes. Creating, moving or reordering a card, saving an unchanged value, and reloading an external edit produce no events. Watcher actions that call KBTD inherit a job ID that suppresses nested dispatch.
+Raw title edits can trigger owner and tag changes. Creating or reordering a card, moving it within its column, saving an unchanged value, and reloading an external edit produce no events. For a move, the event's column and path give the task's new place, and `before.status` its old column. Watcher actions that call KBTD inherit a job ID that suppresses nested dispatch.
 
 Use `kbtd watch list` to see definitions and `kbtd watch remove NAME` to stop future matches.
 

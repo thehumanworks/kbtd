@@ -90,6 +90,27 @@ class TuiTests(unittest.TestCase):
             self.assertTrue(self.ui.poll())
             emit.assert_not_called()
 
+    def test_moves_by_key_and_drag_emit_status_changes(self):
+        ui, view = self.ui, self.view
+        with patch("kbtd.storage.Watchers.emit_many") as emit:
+            view.draw(ui)
+            ui.mouse(view, 0, 3, curses.BUTTON1_CLICKED)
+            view.draw(ui)
+            ui.mouse(view, 2, 3, curses.BUTTON1_PRESSED)
+            ui.mouse(view, 82, 8, curses.BUTTON1_RELEASED)  # drag "first" into Done
+            ui.key("H")
+            ui.key("H")
+            ui.key("H")  # already in the first column: no move
+            ui.key("J")  # reordering is not a status change
+            events = [call.args[0][0] for call in emit.call_args_list]
+        self.assertEqual([kinds for kinds, _ in events], [("task.status.changed",)] * 3)
+        self.assertEqual([(p["before"]["status"], p["after"]["status"], p["column"], p["column_number"])
+                          for _, p in events],
+                         [("Queue", "Done", "Done", 3), ("Done", "Doing", "Doing", 2), ("Doing", "Queue", "Queue", 1)])
+        # The path names the task's place after the move; Queue appends it after "second".
+        self.assertEqual([(p["after"]["text"], p["path"]) for _, p in events],
+                         [("first", "1"), ("first", "1"), ("first", "2")])
+
     def test_conditional_watcher_follows_tui_edits_across_columns(self):
         os.environ.pop("KBTD_JOB_ID", None)  # setUp isolates the environment
         watchers = Watchers(self.source.path)
