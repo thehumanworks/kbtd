@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import watch_cli
+from .conditions import reference
 from .events import edit_events
 from .markdown import Column, Document, Section
 from .storage import BoardFile
@@ -18,7 +19,7 @@ COMMANDS = {
     "init": "create a starter board; never overwrite a file",
     "list": "list boards, columns and numbered cards",
     "watch": "configure background shell actions and inspect their jobs",
-    "add": "append an unchecked card",
+    "add": "append an unchecked card with the next card ID and print the ID",
     "subtask": "append an unchecked child to the selected task",
     "show": "print the selected task and its attached Markdown",
     "owner": "set the task owner, or remove it with --clear",
@@ -45,7 +46,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     subs = parser.add_subparsers(dest="command", metavar="COMMAND")
     for command, help_text in COMMANDS.items():
-        sub = subs.add_parser(command, help=help_text, description=help_text, parents=[common])
+        extra = {}
+        if command == "watch":  # keep the trigger reference's columns
+            extra = {"epilog": "triggers:\n" + reference(),
+                     "formatter_class": argparse.RawDescriptionHelpFormatter}
+        sub = subs.add_parser(command, help=help_text, description=help_text, parents=[common], **extra)
         if command == "watch":
             watch_cli.add_arguments(sub, common)
             continue
@@ -102,11 +107,18 @@ def _listing(doc: Document, section: str | None, column: str | None) -> None:
             print(f"  ## {c + 1}. {lane.name}")
             for path, card in lane.rows:
                 print(f"     {' ' * card.indent}{path}. [{'x' if card.done else ' '}] {card.text}")
+    _warn(doc)
 
 
-def _change(doc: Document, args: argparse.Namespace, board: Section, column: Column) -> Document:
+def _warn(doc: Document) -> None:
+    for warning in doc.id_warnings:
+        print(f"kbtd: {warning}", file=sys.stderr)
+
+
+def _change(source: BoardFile, doc: Document, args: argparse.Namespace, board: Section,
+            column: Column) -> Document:
     if args.command == "add":
-        return doc.add(column, args.text)
+        return doc.add(column, args.text, source.id_prefix(doc))
     if args.command in ("up", "down"):
         changed, _ = doc.reorder(column, args.card, -1 if args.command == "up" else 1)
         return changed
@@ -149,13 +161,18 @@ def _task_command(source: BoardFile, doc: Document, args: argparse.Namespace) ->
         if value:
             print(value)
         return
-    changed = _change(doc, args, board, column)
+    changed = _change(source, doc, args, board, column)
     if changed is doc:
         return
     events = []
     if args.command in ("toggle", "owner", "edit", "block", "unblock", "due"):
         events = edit_events(doc, changed, s, c, args.card)
     saved = source.save(changed, events)
+    if args.command == "add":
+        added = saved.document.sections[s].columns[c].cards[-1]
+        if added.id:
+            print(added.id)
+        _warn(saved.document)
     if saved.watcher_warning:
         raise RuntimeError(saved.watcher_warning)
 

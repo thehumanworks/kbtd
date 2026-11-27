@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .events import Event
+from .ids import default_prefix
 from .markdown import Document, parse_markdown
 from .watchers import SkippedWatchers, Watchers
 
@@ -56,6 +57,10 @@ class BoardFile:
     def create(self) -> None:
         with self.path.open("x", encoding="utf-8", newline="") as f:
             f.write(TEMPLATE)
+
+    def id_prefix(self, document: Document) -> str:
+        """The prefix for a new card ID: the board's counter line, else derived once."""
+        return document.id_prefix or default_prefix(self.path)
 
     def version(self) -> Version:
         return _version(self.path.stat())

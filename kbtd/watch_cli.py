@@ -6,7 +6,7 @@ from pathlib import Path
 
 import sys
 
-from .conditions import EVENTS, FIELDS, compile_trigger
+from .conditions import compile_trigger, reference
 from .watchers import Watchers
 
 
@@ -15,10 +15,9 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     add = commands.add_parser("add", parents=[common], help="register a shell command for this board file")
     add.add_argument("name", help="unique watcher name")
     add.add_argument("trigger", help=(
-        f"event ({', '.join(EVENTS)}) or a quoted Python condition, "
+        "event name or a quoted Python condition, "
         "e.g. 'owner.changed and \"codex\" in task.owners and task.status == \"Backlog\"'. "
-        f"Names: {', '.join(name for name in FIELDS if name not in EVENTS)}; "
-        "operators: and, or, not, ==, !=, in, not in."
+        "'kbtd watch triggers' lists every event, field and operator."
     ))
     add.add_argument("action", help="one quoted shell command, run in the board directory")
     commands.add_parser("list", parents=[common], help="list configured watchers")
@@ -31,9 +30,13 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     retry.add_argument("id", type=int, help="job number from 'watch jobs'")
     cancel = commands.add_parser("cancel", parents=[common], help="cancel a queued job before it starts")
     cancel.add_argument("id", type=int, help="job number from 'watch jobs'")
+    commands.add_parser("triggers", parents=[common], help="list the events, fields and operators of a trigger")
 
 
 def manage(path: Path, args: argparse.Namespace) -> None:
+    if args.watch_command == "triggers":
+        print(reference())
+        return
     watchers = Watchers(path)
     match args.watch_command:
         case "add":

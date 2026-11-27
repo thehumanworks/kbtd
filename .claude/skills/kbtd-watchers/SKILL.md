@@ -32,7 +32,7 @@ One SQLite file per board holds the DBOS tables plus `kbtd_watchers` and `kbtd_o
 
 ## Triggers (`kbtd/conditions.py`, ADR 0003)
 
-A trigger is a Python expression. `ast.parse` reads it, and `_Compiler` turns an allow-listed, typed subset into `matcher(event_names, payload) -> bool`. Never `eval` trigger text. To add a name, add it to `FIELDS` with its type and reader, then document it in the README table, ADR 0003 and the `watch add` help. Keep these rules:
+A trigger is a Python expression. `ast.parse` reads it, and `_Compiler` turns an allow-listed, typed subset into `matcher(event_names, payload) -> bool`. Never `eval` trigger text. To add a name, add it to `FIELDS` with its type and reader and to `HELP` with one line of text, then document it in the README table and ADR 0003. `kbtd watch triggers` and the end of `kbtd watch --help` are generated from `FIELDS` and `HELP`, and a test fails if either misses a name or the README lacks one. Keep these rules:
 
 - Every new node type needs a type check, so mistakes fail at `kbtd watch add`, not silently on each edit.
 - `emit_many` compiles each stored watcher separately. An invalid one raises `SkippedWatchers` after the valid jobs are committed, and `BoardFile.save` turns that into a "Board saved. Skipped watcher ..." warning.

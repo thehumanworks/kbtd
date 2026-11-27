@@ -97,7 +97,9 @@ class View:
             dates = ""
             if show_dates and card.date_tokens:
                 dates = "Due " + ", ".join(m[0].removeprefix("#due-") for m in card.date_tokens) + " · "
-            label = ("BLOCKED · " if card.blocked else "") + dates + card.text_without_dates
+            # The card ID leads, before the BLOCKED and due-date badges.
+            text = card.text_without_dates.removeprefix(card.id).lstrip(" \t") if card.id else card.text_without_dates
+            label = (card.id + " " if card.id else "") + ("BLOCKED · " if card.blocked else "") + dates + text
             return textwrap.wrap(label, width=max(1, width - 5 - len(margin(i))),
                                  max_lines=min(3, capacity), placeholder="…") or [""]
 
@@ -242,6 +244,8 @@ class View:
         if ui.mode in ("add", "edit", "subtask", "owner", "description", "due"):
             label = {"add": "New card: ", "edit": "Edit: ", "subtask": "New child: ",
                      "owner": "Owner: ", "description": "Description: ", "due": "Due: "}[ui.mode]
+            if ui.mode == "edit" and ui.card and ui.card.id:
+                label = f"Edit {ui.card.id}: "
             # Keep the insertion point visible when editing a long line.
             display = ui.draft.replace("\n", "↵")
             before = _clip(display[:ui.caret][::-1], self.width - len(label) - 2)[::-1]

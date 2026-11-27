@@ -23,7 +23,7 @@ Conditional triggers used a TLA+-style syntax (`owner.changed = "codex" /\ task.
 
 A trigger is a Python expression. `ast.parse(source, mode="eval")` produces the syntax tree. `kbtd/conditions.py` compiles only an allow-listed subset into a matcher, with a type for every node:
 
-- **Names:** the four event names (booleans: did this edit emit the event), plus `task.status`, `task.section`, `task.text` (strings), `task.done` (boolean), and `task.owners` and `task.tags` (lists of strings), all read after the edit.
+- **Names:** the four event names (booleans: did this edit emit the event), plus `task.id` (added by [ADR 0004](0004-card-ids.md)), `task.status`, `task.section`, `task.text` (strings), `task.done` (boolean), and `task.owners` and `task.tags` (lists of strings), all read after the edit.
 - **Operators:** `and`, `or`, `not`, parentheses, and single comparisons with `==`, `!=`, `in`, `not in`.
 - **Values:** quoted strings, `True`, `False`, and lists of quoted strings.
 

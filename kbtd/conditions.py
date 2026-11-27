@@ -33,6 +33,7 @@ def _event(name: str) -> Reader:
 # Each name's type and how to read it from (event names, event payload).
 FIELDS: dict[str, tuple[str, Reader]] = {
     **{name: (BOOL, _event(name)) for name in EVENTS},
+    "task.id": (STR, _after("id", "")),
     "task.status": (STR, lambda kinds, payload: payload.get("column", "")),
     "task.section": (STR, lambda kinds, payload: payload.get("section", "")),
     "task.text": (STR, _after("text", "")),
@@ -40,6 +41,41 @@ FIELDS: dict[str, tuple[str, Reader]] = {
     "task.owners": (LIST, _after("owners", [])),
     "task.tags": (LIST, _after("tags", [])),
 }
+# What `kbtd watch triggers` and `kbtd watch --help` say about each name.
+# tests/test_cli.py checks that every event and field has an entry.
+HELP = {
+    "owner.changed": "an owner is assigned, replaced or cleared",
+    "tags.changed": "trailing tags change, incl. #blocked and #due-YYYY-MM-DD",
+    "task.completed": "checkbox goes from open to done",
+    "task.reopened": "checkbox goes from done to open",
+    "task.id": 'card ID, e.g. "KBT-0001"; "" if none',
+    "task.status": "column name",
+    "task.section": "board (H1) name",
+    "task.text": "task-line text, without the card ID",
+    "task.done": "checkbox",
+    "task.owners": "owners, sorted, without @",
+    "task.tags": "tags, sorted, without #",
+}
+
+
+def reference() -> str:
+    """Every event, field and operator a trigger can use, as plain text."""
+    events = [f"  {name:<15} {HELP[name]}" for name in EVENTS]
+    fields = [f"  {name:<15} {FIELDS[name][0].removeprefix('a '):<16} {HELP[name]}"
+              for name in FIELDS if name not in EVENTS]
+    return "\n".join([
+        "EVENTS     true when the edit emitted it", *events, "",
+        "FIELDS     value after the edit", *fields, "",
+        "OPERATORS  and  or  not  ==  !=  in  not in  ( )",
+        'VALUES     "quoted strings", True, False, ["lists", "of", "strings"]',
+        "NO EVENT   creating, moving, reordering or deleting a card; editing a description",
+        "",
+        "Example:",
+        "  kbtd watch add codex-backlog 'owner.changed and \"codex\" in task.owners and "
+        "task.status == \"Backlog\"' 'CMD'",
+    ])
+
+
 _COMPARE: dict[type, Callable[[object, object], bool]] = {
     ast.Eq: lambda a, b: a == b,
     ast.NotEq: lambda a, b: a != b,

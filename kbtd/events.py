@@ -11,7 +11,8 @@ type Event = tuple[str | tuple[str, ...], dict]
 def _fields(card: Card) -> dict:
     tokens = {match[0] for match in card.metadata}
     return {
-        "text": card.text,
+        "id": card.id,
+        "text": card.title,
         "done": card.done,
         "owners": sorted(token[1:] for token in tokens if token.startswith("@")),
         "tags": sorted(token[1:] for token in tokens if token.startswith("#")),

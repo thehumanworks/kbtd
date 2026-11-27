@@ -88,6 +88,27 @@ Put editable metadata together at the end of the task line, separated by spaces 
 
 The description prefix and due-date tag are KBTD conventions. Other indented text travels with its task and can be read with `i` or `kbtd show`. Preambles, fenced examples and unrelated prose stay in the file. Edit headings by hand to create or rename boards and columns.
 
+### Card IDs
+
+Every top-level card added with `kbtd add` or the TUI starts with an ID, such as `KBT-0001`. `kbtd add` prints it. Subtasks and cards that already existed get none. The first new card writes one comment line at the top of the file, which Markdown viewers such as GitHub do not display:
+
+```markdown
+<!-- kbtd next-id: KBT-0002 -->
+# Tasks
+
+## Backlog
+
+- [ ] KBT-0001 Fix login
+```
+
+The prefix is set once, when that line is written. It is the first three letters of the GitHub repository's name from the `origin` remote (`thehumanworks/kbtd` gives `KBT`). Without a GitHub remote, it comes from the git repository's folder, otherwise from the board file's folder. Only letters count, in capitals (`my-app` gives `MYA`). Renaming the repository or folder later does not change it.
+
+- **Numbers are never reused.** Deleting a card does not free its number. KBTD also never assigns a number at or below an ID already on the board, so hand-written IDs are safe.
+- **Change the prefix** by editing the line, e.g. to `<!-- kbtd next-id: ABC-0001 -->`. New cards use `ABC`. KBTD then counts only `ABC-` titles as IDs, so older `KBT-` cards keep their text but lose ID handling such as `task.id` and duplicate warnings.
+- **Edits keep the ID.** `kbtd edit` and the TUI `e` key replace the title after it. To give a card another ID, start the new text with one: `kbtd edit Tasks Backlog 1 "KBT-0009 Fix login"`.
+- **Duplicates** come from merging two branches that each added cards: both get the same next number. `kbtd list`, `kbtd add` and the TUI name duplicate IDs; renumber one with `kbtd edit`. Two branches that added different numbers of cards also conflict on the counter line; keep either side, since KBTD numbers past the highest ID anyway.
+- **A deleted or malformed counter line** is rewritten by the next new card, numbered after the highest ID on the board.
+
 ## CLI
 
 The default file is `./TODO.md`. Use `-f PATH` / `--file PATH` to use a different file. `kbtd PATH` opens that file in the TUI.
@@ -96,7 +117,7 @@ The default file is `./TODO.md`. Use `-f PATH` / `--file PATH` to use a differen
 kbtd init [PATH]                      Create Tasks with Backlog, In Progress, Done
 kbtd tui [--theme THEME] [PATH]       Open the section picker or last selected board
 kbtd list [SECTION [COLUMN]]          List numbered sections, columns and cards
-kbtd add SECTION COLUMN TEXT          Append an unchecked card
+kbtd add SECTION COLUMN TEXT          Append an unchecked card and print its new ID
 kbtd toggle SECTION COLUMN CARD       Toggle completion
 kbtd move SECTION COLUMN CARD TARGET  Append card to TARGET in the same section
 kbtd up SECTION COLUMN CARD           Raise a task or subtask one place among siblings
@@ -112,7 +133,7 @@ kbtd show SECTION COLUMN CARD         Print the task and its attached Markdown
 kbtd delete SECTION COLUMN CARD       Delete the whole subtree and notes, without prompting
 ```
 
-Section and column selectors are exact names or **1-based numbers** in file order. Numeric selectors always mean positions. For duplicate names, use the numbers from `list`. Card paths are 1-based positions local to the column, **not** persistent IDs: `2` is the second root, `2.1` its first child. Children do not change root numbers. Use `list` again after adding, moving or deleting tasks. Quote names and text that contain spaces.
+Section and column selectors are exact names or **1-based numbers** in file order. Numeric selectors always mean positions. For duplicate names, use the numbers from `list`. Card paths are 1-based positions local to the column, **not** the [card IDs](#card-ids): `2` is the second root, `2.1` its first child. Children do not change root numbers. Use `list` again after adding, moving or deleting tasks. Quote names and text that contain spaces.
 
 ```sh
 # For the Release column in the example above:
@@ -150,7 +171,7 @@ Both Vercel themes use gray for secondary text on 256-color terminals. Basic col
 | `H`/`L` or `<`/`>` | Move a root task and its subtree to the previous/next column |
 | `K` / `J` | Raise / lower the selected task or subtask one place among its siblings. Its notes, descendants and selection move with it. |
 | Drag card to another column | Append the root and its subtree to that column (mouse-capable terminals) |
-| `a` / `e` | Add a card / edit its text; Enter saves, Esc cancels |
+| `a` / `e` | Add a card with the next ID / edit its text after the ID; Enter saves, Esc cancels |
 | `s` | Add a child to the selected task; Enter saves, Esc cancels |
 | `o` | Edit the owner; save an empty value to clear |
 | `D` | Edit the description. Ctrl-N inserts a line break, Enter saves, Esc cancels. An empty draft clears it. |
@@ -193,14 +214,15 @@ To log assignments to Codex in Backlog, pass the whole condition as one shell ar
 kbtd watch add codex-backlog 'owner.changed and "codex" in task.owners and task.status == "Backlog"' 'printf "%s\n" "$KBTD_EVENT" >> codex.jsonl'
 ```
 
-A condition is a Python expression. KBTD reads it with Python's own parser and evaluates only the names and operators below. It never runs the text as code.
+A condition is a Python expression. KBTD reads it with Python's own parser and evaluates only the names and operators below. It never runs the text as code. `kbtd watch triggers` prints the same reference, and `kbtd watch --help` ends with it.
 
 | Name | Type | Value |
 | --- | --- | --- |
 | `owner.changed`, `tags.changed`, `task.completed`, `task.reopened` | boolean | Whether this edit emitted that event |
+| `task.id` | string | [Card ID](#card-ids), such as `KBT-0001`, or `""` for a card without one |
 | `task.status` | string | Column name after the edit |
 | `task.section` | string | Board (H1) name |
-| `task.text` | string | Task-line text after the edit |
+| `task.text` | string | Task-line text after the edit, without the card ID |
 | `task.done` | boolean | Checkbox after the edit |
 | `task.owners`, `task.tags` | list of strings | Owners and tags after the edit, sorted, without `@` and `#` |
 
@@ -212,7 +234,7 @@ For example, `(owner.changed or tags.changed) and task.status == "In Progress"` 
 
 Earlier versions used `/\`, `\/`, `~` and `=`. A watcher saved with that syntax no longer runs. `kbtd watch list` names it, and edits report that it was skipped. Remove it and register it again in the new syntax.
 
-For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KBTD_EVENT.events` in the JSON payload lists the event names from the edit.
+For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KBTD_EVENT.events` in the JSON payload lists the event names from the edit. In the payload, `before` and `after` hold the card's `id` and its `text` without the ID.
 
 Raw title edits can trigger owner and tag changes. Creating, moving or reordering a card, saving an unchanged value, and reloading an external edit produce no events. Watcher actions that call KBTD inherit a job ID that suppresses nested dispatch.
 
@@ -243,7 +265,7 @@ In the TUI, `w` opens the same history, newest first, and refreshes it every sec
 | `f` | Show all, failed or interrupted, running, or queued jobs | |
 | Esc | Back to the board or picker | Back to the list |
 
-Card paths are positions, so `g` first looks in the job's section for a card with the text the edit left, nearest its recorded column and path. If none matches, it selects the recorded position and says that the text changed.
+Card paths are positions, so `g` first looks in the job's section for the card with the job's card ID, then for a card with the text the edit left, nearest its recorded column and path. If none matches, it selects the recorded position and says that the text changed.
 
 Each board's watchers live in one SQLite file under `$XDG_STATE_HOME/kbtd/watchers` (default `~/.local/state/kbtd/watchers`). It is a standard DBOS system database, so the [DBOS CLI](https://docs.dbos.dev/python/reference/cli) can inspect it too, for example `uv run dbos workflow steps 3 -s sqlite:///PATH`. Worker diagnostics go to the `.log` file next to it. [ADR 0001](docs/adr/0001-board-watchers.md) defines triggers and the event contract. [ADR 0002](docs/adr/0002-dbos-watcher-runtime.md) explains the DBOS runtime and how it can move to Postgres.
 

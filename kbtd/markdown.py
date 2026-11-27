@@ -16,6 +16,11 @@ _META = re.compile(r"[@#][\w-]+")
 _WORD = re.compile(r"[^ \t]+")
 _DUE_TAG = re.compile(r"#due-[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _DESCRIPTION = "Description:"
+# Card IDs: a leading token such as KBT-0001. Only the prefix in the board's
+# counter line counts, so a title such as "CVE-2024 patch" is not an ID.
+_ID = re.compile(r"([A-Z]+)-([0-9]{4,})(?=[ \t]|$)")
+_COUNTER = re.compile(r"<!-- kbtd next-id: ([A-Z]+)-([0-9]+) -->")
+_COUNTER_START = "<!-- kbtd next-id:"
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,17 @@ class Card:
     indent: int = 0
     children: tuple[Card, ...] = ()
     description_lines: tuple[str, ...] = ()
+    prefix: str = ""  # the board's ID prefix, from its counter line
+
+    @cached_property
+    def id(self) -> str:
+        m = _ID.match(self.text) if self.prefix else None
+        return m[0] if m and m[1] == self.prefix else ""
+
+    @property
+    def title(self) -> str:
+        """Task-line text without the card ID."""
+        return self.text[len(self.id):].lstrip(" \t") if self.id else self.text
 
     @property
     def description(self) -> str:
@@ -120,12 +136,66 @@ def _validate_text(text: str) -> None:
 
 
 @dataclass(frozen=True)
+class Counter:
+    """The board's ``<!-- kbtd next-id: KBT-0002 -->`` line."""
+    line: int
+    prefix: str = ""  # empty when the line is malformed
+    number: int = 0
+
+
+@dataclass(frozen=True)
 class Document:
     lines: tuple[str, ...]
     sections: tuple[Section, ...]
+    counters: tuple[Counter, ...] = ()
 
     def serialize(self) -> str:
         return "".join(self.lines)
+
+    @property
+    def id_prefix(self) -> str:
+        """The prefix of the board's counter line, or "" before the first ID."""
+        return self.counters[0].prefix if self.counters else ""
+
+    def _cards(self) -> Iterator[Card]:
+        for section in self.sections:
+            for column in section.columns:
+                for _, card in column.rows:
+                    yield card
+
+    @cached_property
+    def id_warnings(self) -> tuple[str, ...]:
+        warnings = []
+        if self.counters and not self.counters[0].prefix:
+            warnings.append(f"ignoring the malformed ID counter on line {self.counters[0].line + 1}; "
+                            "the next new card rewrites it")
+        if len(self.counters) > 1:
+            warnings.append(f"more than one ID counter line; using line {self.counters[0].line + 1}")
+        seen: dict[str, int] = {}
+        for card in self._cards():
+            if card.id:
+                seen[card.id] = seen.get(card.id, 0) + 1
+        duplicates = [f"{card_id} ({n} cards)" for card_id, n in seen.items() if n > 1]
+        if duplicates:
+            free = f"{self.id_prefix}-{self._next_id(self.id_prefix):04d}"
+            warnings.append(f"duplicate card IDs: {', '.join(duplicates)}; "
+                            f"give one a free ID such as {free} with 'kbtd edit'")
+        return tuple(warnings)
+
+    def _next_id(self, prefix: str) -> int:
+        """Never below the counter, nor at or below an ID already on the board.
+
+        Reads the task text, not ``Card.id``, so IDs still count when the
+        counter line is missing or malformed.
+        """
+        highest = 0
+        for card in self._cards():
+            m = _ID.match(card.text)
+            if m and m[1] == prefix:
+                highest = max(highest, int(m[2]))
+        counter = self.counters[0] if self.counters else None
+        stored = counter.number if counter and counter.prefix == prefix else 1
+        return max(stored, highest + 1)
 
     def _updated(self, lines: list[str]) -> Document:
         # A line moved from EOF might have no terminator. Supply separators
@@ -141,10 +211,38 @@ class Document:
                 lines[-1] += newline
         return parse_markdown("".join(lines))
 
-    def add(self, column: Column, text: str) -> Document:
+    def add(self, column: Column, text: str, prefix: str = "") -> Document:
+        """Append a card. With an ID prefix, number it and advance the counter line.
+
+        The counter line's own prefix wins over ``prefix``, which only starts a
+        board that has no valid counter yet.
+        """
         _validate_text(text)
         lines = list(self.lines)
+        prefix = self.id_prefix or prefix
+        if not prefix:
+            lines.insert(column.append_at, f"- [ ] {text}")
+            return self._updated(lines)
+        if not re.fullmatch(r"[A-Z]+", prefix):
+            raise ValueError(f"invalid card ID prefix {prefix!r}; use capital letters A-Z")
+        number = self._next_id(prefix)
+        given = _ID.match(text)
+        if given and given[1] == prefix:  # keep an ID the caller typed
+            number = max(number, int(given[2]) + 1)
+        else:
+            text = f"{prefix}-{number:04d} {text}"
+            number += 1
+        counter = f"{_COUNTER_START} {prefix}-{number:04d} -->"
+        if self.counters:
+            at = self.counters[0].line
+            bom = "\ufeff" if at == 0 and lines[0].startswith("\ufeff") else ""
+            lines[at] = bom + counter + _eol(lines[at])
         lines.insert(column.append_at, f"- [ ] {text}")
+        if not self.counters:
+            bom = "\ufeff" if lines and lines[0].startswith("\ufeff") else ""
+            if bom:
+                lines[0] = lines[0][1:]
+            lines.insert(0, bom + counter)
         return self._updated(lines)
 
     def add_child(self, parent: Card, text: str) -> Document:
@@ -166,7 +264,12 @@ class Document:
         return self._updated(lines)
 
     def edit(self, card: Card, text: str) -> Document:
+        """Replace the task-line text. A card keeps its ID unless ``text`` starts with one."""
         _validate_text(text)
+        stripped = text.lstrip(" \t")
+        given = _ID.match(stripped)
+        if card.id and not (given and given[1] == card.prefix):
+            text = f"{card.id} {stripped}"
         return self._text(card, text)
 
     def _text(self, card: Card, text: str) -> Document:
@@ -327,7 +430,7 @@ def _tree(lines: tuple[str, ...], root: Card) -> Card:
             fence, fence_indent = marker[1], stack[-1][0].indent + 1
         elif (leading == " " * (stack[-1][0].indent + 2)
               and (task := _TASK.fullmatch(content))):
-            child = Card(task[2] or "", task[1] == "x", i, i + 1, indent)
+            child = Card(task[2] or "", task[1] == "x", i, i + 1, indent, prefix=root.prefix)
             stack.append((with_description(child), []))
         end = i + 1
     while len(stack) > 1:
@@ -335,7 +438,7 @@ def _tree(lines: tuple[str, ...], root: Card) -> Card:
     return replace(root, children=tuple(stack[0][1]))
 
 
-def _tokens(lines: tuple[str, ...]) -> Iterator[_Heading | Card]:
+def _tokens(lines: tuple[str, ...]) -> Iterator[_Heading | Card | Counter]:
     i = 0
     fence = ""
     fence_start = 0
@@ -350,6 +453,9 @@ def _tokens(lines: tuple[str, ...]) -> Iterator[_Heading | Card]:
         elif marker:
             fence = marker[1]
             fence_start = i
+        elif body.startswith(_COUNTER_START):
+            counter = _COUNTER.fullmatch(body.rstrip(" \t"))
+            yield Counter(i, counter[1], int(counter[2])) if counter else Counter(i)
         elif heading := _HEADING.fullmatch(body):
             yield _Heading(len(heading[1]), heading[2].strip(), i)
         elif task := _TASK.fullmatch(body):
@@ -377,10 +483,15 @@ def parse_markdown(text: str) -> Document:
     cards: list[Card] = []
     section: str | None = None
     column: str | None = None
-    for token in _tokens(lines):
+    tokens = list(_tokens(lines))
+    counters = tuple(token for token in tokens if isinstance(token, Counter))
+    prefix = counters[0].prefix if counters else ""
+    for token in tokens:
+        if isinstance(token, Counter):
+            continue
         if isinstance(token, Card):
             if column is not None:
-                cards.append(_tree(lines, token))
+                cards.append(_tree(lines, replace(token, prefix=prefix)))
             continue
         if column is not None:
             columns.append(Column(column, token.line, tuple(cards)))
@@ -392,4 +503,4 @@ def parse_markdown(text: str) -> Document:
             section, columns = token.name, []
         elif section is not None:
             column = token.name
-    return Document(lines, tuple(sections))
+    return Document(lines, tuple(sections), counters)

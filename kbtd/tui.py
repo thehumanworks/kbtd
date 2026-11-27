@@ -34,10 +34,12 @@ def _locate(doc: Document, event: dict) -> tuple[tuple[int, int, int], bool] | N
     """Section, column and row of the card a watcher event names, and whether its text still matches.
 
     Card paths are positions, so a later move or reorder makes the recorded path
-    point elsewhere. Prefer a card with the event's resulting text, nearest the
-    recorded position, then the recorded position itself.
+    point elsewhere. Prefer the card with the event's card ID, then one with the
+    event's resulting text, nearest the recorded position, then the recorded
+    position itself.
     """
-    text = (event.get("after") or {}).get("text")
+    after = event.get("after") or {}
+    text, card_id = after.get("text"), after.get("id")
     best = None
     for s, section in enumerate(doc.sections):
         if section.name != event.get("section"):
@@ -45,11 +47,12 @@ def _locate(doc: Document, event: dict) -> tuple[tuple[int, int, int], bool] | N
         for c, column in enumerate(section.columns):
             same_column = column.name == event.get("column")
             for r, (path, card) in enumerate(column.rows):
-                same_text = text is not None and card.text == text
+                same_id = bool(card_id) and card.id == card_id
+                same_text = text is not None and text in (card.title, card.text)
                 recorded = same_column and path == event.get("path")
-                if not (same_text or recorded):
+                if not (same_id or same_text or recorded):
                     continue
-                rank = (same_text, s + 1 == event.get("section_number"), same_column,
+                rank = (same_id, same_text, s + 1 == event.get("section_number"), same_column,
                         c + 1 == event.get("column_number"), recorded)
                 if best is None or rank > best[0]:
                     best = rank, (s, c, r), same_text
@@ -139,6 +142,7 @@ class BoardUI:
         self.watchers = Watchers(source.path)
         self.jobs = JobList(self.watchers)
         self._install(snapshot, self.state.load())
+        self.notice = next(iter(self.doc.id_warnings), "")
         try:
             self.watchers.wake()
         except (OSError, RuntimeError) as e:
@@ -212,7 +216,7 @@ class BoardUI:
                 self.mode = "browse"
             return changed
         self.read_error = ""
-        self.notice = "Reloaded from disk"
+        self.notice = " · ".join(["Reloaded from disk", *self.doc.id_warnings[:1]])
         return True
 
     def refresh_jobs(self) -> bool:
@@ -234,7 +238,7 @@ class BoardUI:
         except (OSError, UnicodeError) as e:
             self.notice = f"Not saved: {e}"
             return False
-        self.notice = self.snapshot.watcher_warning or "Saved"
+        self.notice = self.snapshot.watcher_warning or next(iter(self.doc.id_warnings), "Saved")
         return True
 
     def _move(self, source: int, row: int, dest: int) -> None:
@@ -257,9 +261,12 @@ class BoardUI:
             column, card = self.column, self.card
             try:
                 if self.mode == "add" and column:
-                    if self._save(self.doc.add(column, self.draft)):
+                    if self._save(self.doc.add(column, self.draft, self.source.id_prefix(self.doc))):
                         self.row = len(column.rows)
                         self._fit()
+                        added = self.card
+                        if added and added.id and self.notice == "Saved":
+                            self.notice = f"Added {added.id}"
                 elif self.mode == "subtask" and card:
                     if self._save(self.doc.add_child(card, self.draft)) and self.column:
                         self.row = next((i for i, (_, child) in enumerate(self.column.rows)
@@ -438,7 +445,8 @@ class BoardUI:
                 except ValueError as e:
                     self.notice = str(e)
             elif key == "e":
-                self.mode, self.draft, self.caret = "edit", card.text, len(card.text)
+                # The ID is kept on save, so only the title after it is editable.
+                self.mode, self.draft, self.caret = "edit", card.title, len(card.title)
             elif key == "d":
                 self.mode = "delete"
         return True

@@ -1,7 +1,9 @@
 import io
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from contextlib import chdir, redirect_stderr, redirect_stdout
@@ -32,15 +34,16 @@ class CliTests(unittest.TestCase):
     def test_end_to_end(self):
         path = str(self.file)
         self.cli("init", path)
-        self.cli("add", "-f", path, "Tasks", "Backlog", "Design a prototype")
+        # The temporary folder is not a git repository: tmpXXXX gives TMP.
+        self.assertEqual(self.cli("add", "-f", path, "Tasks", "Backlog", "Design a prototype"), "TMP-0001\n")
         self.cli("-f", path, "move", "1", "1", "1", "In Progress")
         self.cli("--file", path, "toggle", "Tasks", "2", "1")
         self.cli("-f", path, "edit", "1", "2", "1", "Design mockups")
         listing = self.cli("list", "Tasks", "In Progress", "-f", path)
         self.assertIn("## 2. In Progress", listing)
-        self.assertIn("1. [x] Design mockups", listing)
+        self.assertIn("1. [x] TMP-0001 Design mockups", listing)
         self.assertNotIn("Backlog", listing)
-        self.assertIn("- [x] Design mockups", self.file.read_text())
+        self.assertIn("- [x] TMP-0001 Design mockups", self.file.read_text())
         self.cli("-f", path, "delete", "1", "2", "1")
         self.assertNotIn("Design mockups", self.file.read_text())
 
@@ -279,3 +282,87 @@ class CliTests(unittest.TestCase):
         self.assertEqual((event["events"], event["trigger"], event["column"], event["path"]),
                          (["owner.changed", "tags.changed"], together, "Backlog", "1.1"))
         self.assertEqual(event["after"]["owners"], ["codex"])
+
+
+class CardIdCliTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(args)
+        self.assertEqual(code, 0, err.getvalue())
+        return out.getvalue(), err.getvalue()
+
+    def test_prefix_rules(self):
+        from kbtd.ids import from_name, github_repo
+        for url, name in [("https://github.com/thehumanworks/kbtd.git", "kbtd"),
+                          ("git@github.com:someone/my-app.git", "my-app"),
+                          ("ssh://git@github.com/someone/widgets/", "widgets"),
+                          ("https://token@github.com/someone/x", "x"),
+                          ("https://gitlab.com/someone/kbtd.git", ""), ("", "")]:
+            self.assertEqual(github_repo(url), name, url)
+        self.assertEqual([from_name(n) for n in ("kbtd", "my-app", "2fa-tool", "ui", "2025")],
+                         ["KBT", "MYA", "FAT", "UI", "TSK"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_prefix_comes_from_github_then_the_repository_then_the_folder(self):
+        def git(*args):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+        repo = self.root / "widgets-local"
+        (repo / "docs").mkdir(parents=True)
+        git("init", "-q")
+        board = repo / "docs" / "TODO.md"
+        self.cli("init", str(board))
+        self.assertEqual(self.cli("add", "-f", str(board), "1", "1", "no remote")[0], "WID-0001\n")
+        board.unlink()
+        git("remote", "add", "origin", "git@github.com:someone/kbtd.git")
+        self.cli("init", str(board))
+        self.assertEqual(self.cli("add", "-f", str(board), "1", "1", "first")[0], "KBT-0001\n")
+        git("remote", "set-url", "origin", "https://github.com/someone/renamed.git")
+        self.assertEqual(self.cli("add", "-f", str(board), "1", "1", "second")[0], "KBT-0002\n")
+        outside = self.root / "notes" / "TODO.md"
+        outside.parent.mkdir()
+        self.cli("init", str(outside))
+        self.assertEqual(self.cli("add", "-f", str(outside), "1", "1", "x")[0], "NOT-0001\n")
+
+    def test_list_and_add_warn_about_duplicate_ids(self):
+        board = self.root / "TODO.md"
+        board.write_text("<!-- kbtd next-id: KBT-0002 -->\n# T\n## B\n- [ ] KBT-0001 a\n- [ ] KBT-0001 b\n")
+        out, err = self.cli("list", "-f", str(board))
+        self.assertIn("1. [ ] KBT-0001 a", out)
+        self.assertIn("kbtd: duplicate card IDs: KBT-0001 (2 cards)", err)
+        out, err = self.cli("add", "-f", str(board), "1", "1", "c")
+        self.assertEqual(out, "KBT-0002\n")
+        self.assertIn("duplicate card IDs", err)
+
+    def test_watch_triggers_lists_every_event_and_field(self):
+        from kbtd.conditions import EVENTS, FIELDS, HELP, reference
+        self.assertEqual(set(HELP), set(FIELDS) | set(EVENTS))
+        out, _ = self.cli("watch", "triggers")
+        self.assertEqual(out, reference() + "\n")
+        readme = (Path(__file__).parents[1] / "README.md").read_text()
+        for name in FIELDS:
+            self.assertTrue(f"`{name}`" in readme, f"README does not document {name}")
+            self.assertIn(name, out)
+        help_out = io.StringIO()
+        with redirect_stdout(help_out), self.assertRaises(SystemExit):
+            main(["watch", "--help"])
+        self.assertIn("triggers            list the events", help_out.getvalue())
+        self.assertIn(reference(), help_out.getvalue())
+
+    def test_watchers_see_the_id_apart_from_the_text(self):
+        from kbtd.conditions import compile_trigger
+        from kbtd.events import edit_events
+        from kbtd.markdown import parse_markdown
+        old = parse_markdown("<!-- kbtd next-id: KBT-0002 -->\n# T\n## B\n- [ ] KBT-0001 Fix\n")
+        new = old.set_owner(old.sections[0].columns[0].cards[0], "codex")
+        [(kinds, payload)] = edit_events(old, new, 0, 0, "1")
+        self.assertEqual((payload["after"]["id"], payload["after"]["text"]), ("KBT-0001", "Fix @codex"))
+        self.assertTrue(compile_trigger('owner.changed and task.id == "KBT-0001"')(kinds, payload))
+        self.assertFalse(compile_trigger('task.id == "KBT-0002"')(kinds, payload))
+        self.assertFalse(compile_trigger('owner.changed and task.id == "x"')(kinds, {"after": {}}))

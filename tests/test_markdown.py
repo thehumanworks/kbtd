@@ -146,3 +146,68 @@ class MarkdownTests(unittest.TestCase):
         self.assertEqual(flagged.serialize(), doc.serialize().replace("#ops  ", "#ops #blocked  "))
         self.assertIs(flagged.set_blocked(task, True), flagged)
         self.assertEqual(flagged.set_blocked(task, False).serialize(), doc.serialize())
+
+
+class CardIdTests(unittest.TestCase):
+    def test_add_numbers_cards_and_keeps_the_counter_on_line_one(self):
+        doc = parse_markdown("﻿# Tasks\r\n\r\n## Backlog\r\n\r\n## Done\r\n")
+        backlog = lambda d: d.sections[0].columns[0]
+        doc = doc.add(backlog(doc), "Fix login", "KBT")
+        doc = doc.add(backlog(doc), "Fix signup @bob", "ZZZ")  # the counter's prefix wins
+        self.assertEqual(doc.serialize(), "﻿<!-- kbtd next-id: KBT-0003 -->\r\n# Tasks\r\n\r\n## Backlog\r\n\r\n"
+                                          "- [ ] KBT-0001 Fix login\r\n- [ ] KBT-0002 Fix signup @bob\r\n## Done\r\n")
+        card = backlog(doc).cards[1]
+        self.assertEqual((card.id, card.title, card.field("owner")[0]), ("KBT-0002", "Fix signup @bob", "@bob"))
+        # A deleted card's number is not reused.
+        doc = doc.delete(card)
+        doc = doc.add(backlog(doc), "Fix logout", "KBT")
+        self.assertEqual(backlog(doc).cards[1].text, "KBT-0003 Fix logout")
+        self.assertIn("next-id: KBT-0004 -->", doc.lines[0])
+        self.assertEqual(parse_markdown(doc.serialize()), doc)
+        # Subtasks get no ID, and a document without a prefix numbers nothing.
+        child = doc.add_child(backlog(doc).cards[0], "step")
+        self.assertEqual(backlog(child).cards[0].children[0].text, "step")
+        plain = parse_markdown("# T\n## B\n").add(parse_markdown("# T\n## B\n").sections[0].columns[0], "x")
+        self.assertEqual(plain.serialize(), "# T\n## B\n- [ ] x\n")
+        self.assertRaises(ValueError, parse_markdown("# T\n## B\n").add,
+                          parse_markdown("# T\n## B\n").sections[0].columns[0], "x", "kbt")
+
+    def test_only_the_boards_prefix_is_an_id(self):
+        text = ("<!-- kbtd next-id: KBT-0002 -->\n# T\n## B\n- [ ] CVE-2024 patch\n- [ ] KBT-0001 Real\n"
+                "- [ ] KBT-12 short\n- [ ] KBT-0001x glued\n```\n<!-- kbtd next-id: ABC-0001 -->\n```\n")
+        doc = parse_markdown(text)
+        self.assertEqual([c.id for c in doc.sections[0].columns[0].cards], ["", "KBT-0001", "", ""])
+        self.assertEqual((doc.id_prefix, len(doc.counters), doc.id_warnings), ("KBT", 1, ()))
+        # Without a counter line no title counts as an ID.
+        self.assertEqual(parse_markdown("# T\n## B\n- [ ] KBT-0001 Real\n").sections[0].columns[0].cards[0].id, "")
+
+    def test_next_number_never_repeats_an_id_on_the_board(self):
+        text = "<!-- kbtd next-id: KBT-0002 -->\n# T\n## B\n- [ ] KBT-0009 hand-numbered\n  - [ ] KBT-0011 sub\n"
+        doc = parse_markdown(text)
+        doc = doc.add(doc.sections[0].columns[0], "next", "KBT")
+        self.assertEqual(doc.sections[0].columns[0].cards[-1].text, "KBT-0012 next")
+        doc = doc.add(doc.sections[0].columns[0], "KBT-0040 typed", "KBT")  # a typed ID is kept
+        self.assertEqual(doc.sections[0].columns[0].cards[-1].text, "KBT-0040 typed")
+        self.assertIn("KBT-0041", doc.lines[0])
+
+    def test_bad_counter_and_duplicates_are_reported_and_repaired_on_add(self):
+        doc = parse_markdown("<!-- kbtd next-id: oops -->\n# T\n## B\n- [ ] KBT-0007 a\n- [ ] KBT-0007 b\n")
+        self.assertIn("malformed ID counter on line 1", doc.id_warnings[0])
+        doc = doc.add(doc.sections[0].columns[0], "c", "KBT")
+        self.assertEqual(doc.lines[0], "<!-- kbtd next-id: KBT-0009 -->\n")
+        self.assertEqual(doc.sections[0].columns[0].cards[-1].text, "KBT-0008 c")
+        self.assertEqual(doc.id_warnings, ("duplicate card IDs: KBT-0007 (2 cards); "
+                                           "give one a free ID such as KBT-0009 with 'kbtd edit'",))
+        self.assertEqual(parse_markdown("<!-- kbtd next-id: KBT-0001 -->  \n# T\n").id_warnings, ())
+        twice = parse_markdown("<!-- kbtd next-id: KBT-0001 -->\n<!-- kbtd next-id: ABC-0001 -->\n# T\n")
+        self.assertEqual(twice.id_warnings, ("more than one ID counter line; using line 1",))
+
+    def test_edits_keep_the_id(self):
+        doc = parse_markdown("<!-- kbtd next-id: KBT-0003 -->\n# T\n## B\n- [ ] KBT-0001 Old @ada\n")
+        card = doc.sections[0].columns[0].cards[0]
+        self.assertEqual(doc.edit(card, "New @bob").lines[3], "- [ ] KBT-0001 New @bob\n")
+        self.assertEqual(doc.edit(card, "KBT-0002 Renumbered").lines[3], "- [ ] KBT-0002 Renumbered\n")
+        self.assertEqual(doc.edit(card, "CVE-2024 patch").lines[3], "- [ ] KBT-0001 CVE-2024 patch\n")
+        self.assertEqual(doc.set_owner(card, None).lines[3], "- [ ] KBT-0001 Old\n")
+        self.assertEqual(doc.set_due(card, "2027-01-02").lines[3], "- [ ] KBT-0001 Old @ada #due-2027-01-02\n")
+        self.assertEqual(doc.toggle(card).lines[3], "- [x] KBT-0001 Old @ada\n")

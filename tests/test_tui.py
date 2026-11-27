@@ -13,7 +13,7 @@ try:
 except ImportError as e:
     raise unittest.SkipTest("curses unavailable") from e
 
-from kbtd.tui import BoardUI, _apply_theme
+from kbtd.tui import BoardUI, _apply_theme, _locate
 from kbtd.view import View
 
 
@@ -185,6 +185,16 @@ class TuiTests(unittest.TestCase):
         ui.key("\x1b")
         self.assertEqual((ui.mode, ui.board.name), ("browse", "Alpha"))
 
+    def test_jump_to_card_prefers_the_card_id(self):
+        from kbtd.markdown import parse_markdown
+        doc = parse_markdown("<!-- kbtd next-id: KBT-0003 -->\n# Alpha\n## Queue\n- [ ] KBT-0002 renamed\n"
+                             "- [ ] KBT-0001 old title\n## Done\n- [ ] old title\n")
+        # The card was renamed and moved after the job; its ID still finds it.
+        event = {"section": "Alpha", "section_number": 1, "column": "Done", "column_number": 2,
+                 "path": "1", "after": {"id": "KBT-0002", "text": "old title"}}
+        self.assertEqual(_locate(doc, event), ((0, 0, 0), False))
+        self.assertEqual(_locate(doc, {**event, "after": {"text": "old title"}}), ((0, 1, 0), True))
+
     def test_jobs_view_reports_empty_history_and_errors(self):
         jobs = self.enterContext(patch.object(Watchers, "jobs", return_value=[]))
         self.ui.key("w")
@@ -243,12 +253,15 @@ class TuiTests(unittest.TestCase):
         for ch in "more":
             ui.key(ch)
         ui.key("\n")
-        self.assertEqual((ui.card.text, ui.row), ("more", 1))
+        # The temporary folder is not a git repository: tmpXXXX gives TMP.
+        self.assertEqual((ui.card.text, ui.row, ui.notice), ("TMP-0001 more", 1, "Added TMP-0001"))
         ui.key("e")
+        self.view.draw(ui)
+        self.assertEqual((ui.draft, self.screen.entries[16, 0][0][:16]), ("more", "Edit TMP-0001: m"))
         ui.key(curses.KEY_HOME)
         ui.key("S")
         ui.key("\n")
-        self.assertEqual(ui.card.text, "Smore")
+        self.assertEqual(ui.card.text, "TMP-0001 Smore")
         ui.key("d")
         ui.key("n")
         self.assertEqual(len(ui.column.cards), 2)
