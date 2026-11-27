@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import watch_cli
 from .conditions import reference
-from .events import edit_events
+from .events import edit_events, move_events
 from .markdown import Column, Document, Section
 from .storage import BoardFile
 
@@ -167,6 +167,8 @@ def _task_command(source: BoardFile, doc: Document, args: argparse.Namespace) ->
     events = []
     if args.command in ("toggle", "owner", "edit", "block", "unblock", "due"):
         events = edit_events(doc, changed, s, c, args.card)
+    elif args.command == "move":
+        events = move_events(doc, changed, s, c, args.card, _index(board.columns, args.target, "column"))
     saved = source.save(changed, events)
     if args.command == "add":
         added = saved.document.sections[s].columns[c].cards[-1]

@@ -16,7 +16,7 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     add.add_argument("name", help="unique watcher name")
     add.add_argument("trigger", help=(
         "event name or a quoted Python condition, "
-        "e.g. 'owner.changed and \"codex\" in task.owners and task.status == \"Backlog\"'. "
+        "e.g. '\"codex\" in owner.added and task.status == \"Backlog\"'. "
         "'kbtd watch triggers' lists every event, field and operator."
     ))
     add.add_argument("action", help="one quoted shell command, run in the board directory")

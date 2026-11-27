@@ -16,8 +16,10 @@ type Matcher = Callable[[tuple[str, ...], dict], bool]
 type Reader = Callable[[tuple[str, ...], dict], object]
 
 # Event names double as boolean names: true when this edit emitted the event.
-EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened")
+EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened", "task.status.changed")
 BOOL, STR, LIST = "a boolean", "a string", "a list of strings"
+# A column name when this edit moved the task, otherwise None.
+MOVE = "a column name only when the task moved (None otherwise)"
 MAX_LENGTH = 4096
 MAX_DEPTH = 64
 
@@ -30,9 +32,40 @@ def _event(name: str) -> Reader:
     return lambda kinds, payload: name in kinds
 
 
+def _move(side: str) -> Reader:
+    def read(kinds: tuple[str, ...], payload: dict) -> object:
+        if "task.status.changed" not in kinds:
+            return None
+        return payload.get(side, {}).get("status", payload.get("column") if side == "after" else None)
+    return read
+
+
+def _owner_set(snapshot: object) -> set[str] | None:
+    match snapshot:
+        case {"owners": list() as owners} if all(isinstance(owner, str) for owner in owners):
+            return set(owners)
+    return None
+
+
+def _owner_difference(source: str, other: str) -> Reader:
+    def read(kinds: tuple[str, ...], payload: dict) -> list[str]:
+        if "owner.changed" not in kinds:
+            return []
+        owners = _owner_set(payload.get(source))
+        others = _owner_set(payload.get(other))
+        # A missing snapshot cannot establish who joined or left.
+        if owners is None or others is None:
+            return []
+        return sorted(owners - others)
+
+    return read
+
+
 # Each name's type and how to read it from (event names, event payload).
 FIELDS: dict[str, tuple[str, Reader]] = {
     **{name: (BOOL, _event(name)) for name in EVENTS},
+    "owner.added": (LIST, _owner_difference("after", "before")),
+    "owner.removed": (LIST, _owner_difference("before", "after")),
     "task.id": (STR, _after("id", "")),
     "task.status": (STR, lambda kinds, payload: payload.get("column", "")),
     "task.section": (STR, lambda kinds, payload: payload.get("section", "")),
@@ -40,6 +73,8 @@ FIELDS: dict[str, tuple[str, Reader]] = {
     "task.done": (BOOL, _after("done", False)),
     "task.owners": (LIST, _after("owners", [])),
     "task.tags": (LIST, _after("tags", [])),
+    "task.status.changed_from": (MOVE, _move("before")),
+    "task.status.changed_to": (MOVE, _move("after")),
 }
 # What `kbtd watch triggers` and `kbtd watch --help` say about each name.
 # tests/test_cli.py checks that every event and field has an entry.
@@ -48,6 +83,9 @@ HELP = {
     "tags.changed": "trailing tags change, incl. #blocked and #due-YYYY-MM-DD",
     "task.completed": "checkbox goes from open to done",
     "task.reopened": "checkbox goes from done to open",
+    "task.status.changed": "the task moves to another column",
+    "owner.added": "owners assigned by this edit, sorted, without @",
+    "owner.removed": "owners cleared by this edit, sorted, without @",
     "task.id": 'card ID, e.g. "KBT-0001"; "" if none',
     "task.status": "column name",
     "task.section": "board (H1) name",
@@ -55,20 +93,25 @@ HELP = {
     "task.done": "checkbox",
     "task.owners": "owners, sorted, without @",
     "task.tags": "tags, sorted, without #",
+    "task.status.changed_from": "old column on a move, else None; only == and in",
+    "task.status.changed_to": "new column on a move, else None; only == and in",
 }
+# Short type names for the reference's TYPE column.
+_KIND = {BOOL: "boolean", STR: "string", LIST: "list of strings", MOVE: "string or None"}
 
 
 def reference() -> str:
     """Every event, field and operator a trigger can use, as plain text."""
-    events = [f"  {name:<15} {HELP[name]}" for name in EVENTS]
-    fields = [f"  {name:<15} {FIELDS[name][0].removeprefix('a '):<16} {HELP[name]}"
+    width = max(map(len, FIELDS))
+    events = [f"  {name:<{width}} {HELP[name]}" for name in EVENTS]
+    fields = [f"  {name:<{width}} {_KIND[FIELDS[name][0]]:<16} {HELP[name]}"
               for name in FIELDS if name not in EVENTS]
     return "\n".join([
         "EVENTS     true when the edit emitted it", *events, "",
         "FIELDS     value after the edit", *fields, "",
         "OPERATORS  and  or  not  ==  !=  in  not in  ( )",
         'VALUES     "quoted strings", True, False, ["lists", "of", "strings"]',
-        "NO EVENT   creating, moving, reordering or deleting a card; editing a description",
+        "NO EVENT   creating, reordering or deleting a card; editing a description",
         "",
         "Example:",
         "  kbtd watch add codex-backlog 'owner.changed and \"codex\" in task.owners and "
@@ -106,6 +149,9 @@ class _Compiler:
             raise self.fail(node, "a fixed value is not a condition; refer to an event or a task field")
         if kind == BOOL:
             return read  # type: ignore[return-value]
+        if kind == MOVE:
+            raise self.fail(node, f"{self.text(node)} is a column name, not a condition; "
+                                  "use task.status.changed to test for a move")
         if kind == LIST:
             return lambda kinds, payload: bool(read(kinds, payload))  # true when not empty
         raise self.fail(node, f"{self.text(node)} is {kind}, not a condition; compare it with == or in")
@@ -160,6 +206,21 @@ class _Compiler:
         hint = f"; did you mean {close[0]!r}?" if close else f"; use one of {', '.join(FIELDS)}"
         raise _Invalid(f"unknown name {name!r}{hint}")
 
+    def compare_move(self, node: ast.AST, op: ast.cmpop, left: tuple[str, Reader],
+                     right: tuple[str, Reader]) -> tuple[str, Reader, bool]:
+        # Without a move these names are None, and None != "x" is true. So != and
+        # "not in" would match every edit that is not a move; refuse them.
+        if isinstance(op, ast.NotEq | ast.NotIn):
+            raise self.fail(node, "task.status.changed_from and changed_to are None unless the task moved, "
+                                  "so != and 'not in' would also match edits that are not moves; for a move "
+                                  "to anywhere but Done, write task.status.changed and not "
+                                  "task.status.changed_to == \"Done\"")
+        if isinstance(op, ast.Eq) and {left[0], right[0]} <= {MOVE, STR} and left[0] != right[0]:
+            return _move_test(op, left[1], right[1])
+        if isinstance(op, ast.In) and left[0] == MOVE and right[0] == LIST:
+            return _move_test(op, left[1], right[1])
+        raise self.fail(node, "compare a moved column with == \"Name\" or in [\"Name\", ...]")
+
     def compare(self, node: ast.AST, left: ast.AST, op: ast.cmpop, right: ast.AST) -> tuple[str, Reader, bool]:
         if type(op) not in _COMPARE:
             raise self.fail(node, "only ==, !=, in and not in can compare values")
@@ -167,6 +228,8 @@ class _Compiler:
         right_kind, read_right, right_constant = self.value(right)
         if left_constant and right_constant:
             raise self.fail(node, "this compares two fixed values; refer to an event or a task field")
+        if MOVE in (left_kind, right_kind):
+            return self.compare_move(node, op, (left_kind, read_left), (right_kind, read_right))
         if isinstance(op, ast.In | ast.NotIn):
             if left_kind != STR or right_kind not in (LIST, STR):
                 raise self.fail(node, f"'in' needs a string on the left and a list or string on the right, "
@@ -174,7 +237,8 @@ class _Compiler:
         elif left_kind != right_kind:
             hint = ""
             if LIST in (left_kind, right_kind) and STR in (left_kind, right_kind):
-                hint = "; to test membership, write \"name\" in task.owners"
+                member, collection = (right, left) if left_kind == LIST else (left, right)
+                hint = f"; to test membership, write {self.text(member)} in {self.text(collection)}"
             raise self.fail(node, f"cannot compare {left_kind} with {right_kind}{hint}")
         test = _COMPARE[type(op)]
         return BOOL, lambda kinds, payload: test(read_left(kinds, payload), read_right(kinds, payload)), False
@@ -190,6 +254,11 @@ def _syntax_hint(source: str) -> str:
     if "\n" in source.strip():
         return "; wrap a trigger that spans lines in parentheses"
     return ""
+
+
+def _move_test(op: ast.cmpop, left: Reader, right: Reader) -> tuple[str, Reader, bool]:
+    test = _COMPARE[type(op)]
+    return BOOL, lambda kinds, payload: test(left(kinds, payload), right(kinds, payload)), False
 
 
 def _depth(node: ast.AST) -> int:
