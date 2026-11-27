@@ -30,9 +30,32 @@ def _event(name: str) -> Reader:
     return lambda kinds, payload: name in kinds
 
 
+def _owner_set(snapshot: object) -> set[str] | None:
+    match snapshot:
+        case {"owners": list() as owners} if all(isinstance(owner, str) for owner in owners):
+            return set(owners)
+    return None
+
+
+def _owner_difference(source: str, other: str) -> Reader:
+    def read(kinds: tuple[str, ...], payload: dict) -> list[str]:
+        if "owner.changed" not in kinds:
+            return []
+        owners = _owner_set(payload.get(source))
+        others = _owner_set(payload.get(other))
+        # A missing snapshot cannot establish who joined or left.
+        if owners is None or others is None:
+            return []
+        return sorted(owners - others)
+
+    return read
+
+
 # Each name's type and how to read it from (event names, event payload).
 FIELDS: dict[str, tuple[str, Reader]] = {
     **{name: (BOOL, _event(name)) for name in EVENTS},
+    "owner.added": (LIST, _owner_difference("after", "before")),
+    "owner.removed": (LIST, _owner_difference("before", "after")),
     "task.status": (STR, lambda kinds, payload: payload.get("column", "")),
     "task.section": (STR, lambda kinds, payload: payload.get("section", "")),
     "task.text": (STR, _after("text", "")),
@@ -138,7 +161,8 @@ class _Compiler:
         elif left_kind != right_kind:
             hint = ""
             if LIST in (left_kind, right_kind) and STR in (left_kind, right_kind):
-                hint = "; to test membership, write \"name\" in task.owners"
+                member, collection = (right, left) if left_kind == LIST else (left, right)
+                hint = f"; to test membership, write {self.text(member)} in {self.text(collection)}"
             raise self.fail(node, f"cannot compare {left_kind} with {right_kind}{hint}")
         test = _COMPARE[type(op)]
         return BOOL, lambda kinds, payload: test(read_left(kinds, payload), read_right(kinds, payload)), False
