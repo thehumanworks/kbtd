@@ -118,12 +118,13 @@ kbtd init [PATH]                      Create Tasks with Backlog, In Progress, Do
 kbtd tui [--theme THEME] [PATH]       Open the section picker or last selected board
 kbtd list [SECTION [COLUMN]]          List numbered sections, columns and cards
 kbtd add SECTION COLUMN TEXT          Append an unchecked card and print its new ID
+                                      (--description TEXT also describes it)
 kbtd toggle SECTION COLUMN CARD       Toggle completion
 kbtd move SECTION COLUMN CARD TARGET  Append card to TARGET in the same section
 kbtd up SECTION COLUMN CARD           Raise a task or subtask one place among siblings
 kbtd down SECTION COLUMN CARD         Lower a task or subtask one place among siblings
 kbtd edit SECTION COLUMN CARD TEXT    Replace task-line text, including any inline tokens
-kbtd subtask SECTION COLUMN CARD TEXT Append a child to CARD
+kbtd subtask SECTION COLUMN CARD TEXT Append a child to CARD (also takes --description TEXT)
 kbtd owner SECTION COLUMN CARD USER   Set or replace owner (or use --clear instead of USER)
 kbtd description SECTION COLUMN CARD [TEXT | --clear]  Read, set or clear a description
 kbtd due SECTION COLUMN CARD [YYYY-MM-DD | --clear]    Read, set or clear a calendar date
@@ -141,6 +142,9 @@ kbtd owner TODO Release 1 bob
 kbtd block TODO Release 1
 kbtd subtask TODO Release 1 "Check screenshots"
 kbtd edit TODO Release 2.1 "Review FAQ links"
+kbtd description TODO Release 1 $'Explain how to publish a release.\nInclude the upgrade steps.'
+kbtd description TODO Release 1      # print it
+kbtd add TODO Ready "Fix login" --description "Users see a 500 after a password reset"
 kbtd show TODO Release 1
 kbtd unblock TODO Release 1
 kbtd owner TODO Release 1 --clear
@@ -165,7 +169,7 @@ Both Vercel themes use gray for secondary text on 256-color terminals. Basic col
 | Key / gesture | Action |
 | --- | --- |
 | ↑/↓ or `k`/`j` | Select a board in the picker, or a card in a column |
-| Enter | Open the selected board, or toggle the selected card |
+| Enter / `i` | Open the selected board, or the selected card's [task view](#task-view) |
 | ←/→ or `h`/`l` | Focus a column |
 | Space / click card | Toggle completion |
 | `H`/`L` or `<`/`>` | Move a root task and its subtree to the previous/next column |
@@ -177,11 +181,43 @@ Both Vercel themes use gray for secondary text on 256-color terminals. Basic col
 | `D` | Edit the description. Ctrl-N inserts a line break, Enter saves, Esc cancels. An empty draft clears it. |
 | `u` / `v` | Edit the due date / toggle date visibility for this session. Enter saves the date. An empty draft clears it. |
 | `B` | Mark or unmark the selected task as blocked |
-| `i` | Inspect the selected Markdown subtree, including notes; ↑/↓ scroll, Esc returns |
 | `w` | Open this file's [watcher jobs](#job-history-and-recovery), from the picker or a board |
 | `d` | Delete selected task, its descendants and notes after confirmation |
 | `b` / Esc / click `[Boards]` | Return to the section picker |
 | `?` / `q` | Show shortcuts / quit |
+
+### Task view
+
+The board shows titles only. Enter or `i` opens the selected task or subtask, with its description and every field KBTD edits. `[Boards]  /  TODO  /  KBT-0001` at the top names the task.
+
+```text
+KBT-0001 · Task 1 · Release
+ Title       Publish guide
+ Done        [ ] open
+ Column      Release
+ Owner       @alice
+ Due         2028-02-29
+ Blocked     no
+ Tags        #docs
+ Description Explain how to publish a release.
+             Include the upgrade steps.
+
+ Subtasks
+             [ ] Review links
+
+ Notes       Keep links relative.
+```
+
+| Key | Action |
+| --- | --- |
+| ↑/↓ or `k`/`j` | Select a row |
+| Enter | Edit the selected title, owner, due date or description in place; toggle Done or Blocked; open a subtask; show the notes as Markdown. On Tags, edit the whole task line. |
+| ←/→ on Column | Move a root task and its subtree to the previous/next column. The view follows it. |
+| Space, `o`, `u`, `D`, `B`, `e`, `s`, `H`/`L`, `K`/`J` | Same as on the board, for the open task |
+| `m` | Show the task's Markdown subtree; ↑/↓ scroll, any other key returns |
+| Esc | Return to the board, with the task selected |
+
+The title row edits the text between the card ID and the trailing `@owner`/`#tag` group; both stay. In the description editor, Ctrl-N inserts a line break, ↑/↓ move between lines, Enter saves and Esc cancels. Pasted text keeps its line breaks; in one-line fields they become spaces. An empty description removes it. Edits save at once, as on the board, and a task edited elsewhere stays open while it is still the selected task.
 
 Edits replace the file atomically, then re-read it. The TUI checks for external changes every 250 ms. Changes reload the board and cancel pending input; if its H1 disappears, you return to the picker. There is no merge or locking: concurrent saves are last-write-wins. The selected section is remembered between sessions, keyed by the absolute Markdown path under `$XDG_STATE_HOME/kbtd` (default `~/.local/state/kbtd`).
 
@@ -208,6 +244,7 @@ kbtd watch jobs
 | `task.completed` | The checkbox changes from open to done. |
 | `task.reopened` | The checkbox changes from done to open. |
 | `task.status.changed` | The task moves to another column: `kbtd move`, `H`/`L`, `<`/`>` or a drag in the TUI. Its subtasks move with it but emit nothing. |
+| `task.description.changed` | The description is added, edited or removed: `kbtd description`, `D` or the task view. |
 
 To log assignments to Codex in Backlog, pass the whole condition as one shell argument.
 
@@ -219,13 +256,15 @@ A condition is a Python expression. KBTD reads it with Python's own parser and e
 
 | Name | Type | Value |
 | --- | --- | --- |
-| `owner.changed`, `tags.changed`, `task.completed`, `task.reopened`, `task.status.changed` | boolean | Whether this edit emitted that event |
+| `owner.changed`, `tags.changed`, `task.completed`, `task.reopened`, `task.status.changed`, `task.description.changed` | boolean | Whether this edit emitted that event |
 | `owner.added`, `owner.removed` | list of strings | Owners who joined or left in this edit, sorted and unique, without `@` |
 | `task.id` | string | [Card ID](#card-ids), such as `KBT-0001`, or `""` for a card without one |
 | `task.status` | string | Column name after the edit |
 | `task.status.changed_from`, `task.status.changed_to` | string or `None` | Column before / after a move. `None` when the edit did not move the task. |
 | `task.section` | string | Board (H1) name |
 | `task.text` | string | Task-line text after the edit, without the card ID |
+| `task.description` | string | Description after the edit, its lines joined by `\n`; `""` without one |
+| `task.description.changed_from`, `task.description.changed_to` | string or `None` | Description before / after this edit; `""` when it was added / removed. `None` when the edit left the description alone. |
 | `task.done` | boolean | Checkbox after the edit |
 | `task.owners`, `task.tags` | list of strings | Owners and tags after the edit, sorted, without `@` and `#` |
 
@@ -235,13 +274,26 @@ Combine conditions with `and`, `or`, `not` and parentheses. Compare with `==`, `
 
 `kbtd watch add` rejects a condition that cannot do what it says: an unknown name (`task.owner`), a comparison of different types (`task.owners == "codex"`), or a fixed value used as a condition (`owner.changed and "codex"`). The error names the part to fix.
 
-`task.status.changed_to == "Done"` matches only the move into Done, and `task.status.changed_from == "Backlog"` only a move out of Backlog. `task.status == "Done"` matches any event-emitting edit of a task that is now in Done. Because the move names are `None` without a move, `!=` and `not in` on them would also match every other edit, so KBTD refuses them. For "moved, but not into Done", write `task.status.changed and not task.status.changed_to == "Done"`.
+`task.status.changed_to == "Done"` matches only the move into Done, and `task.status.changed_from == "Backlog"` only a move out of Backlog. `task.status == "Done"` matches any event-emitting edit of a task that is now in Done.
+
+Descriptions work the same way:
+
+```sh
+kbtd watch add described 'task.description.changed' 'CMD'                          # added, edited or removed
+kbtd watch add exact 'task.description == "Ready for review"' 'CMD'                # whole text, after any edit
+kbtd watch add mentions '"security" in task.description' 'CMD'                      # part of the text
+kbtd watch add now-urgent '"urgent" in task.description.changed_to' 'CMD'           # an edit that leaves "urgent" in it
+kbtd watch add was-draft 'task.description.changed_from == "Draft"' 'CMD'           # the text was exactly "Draft"
+kbtd watch add removed 'task.description.changed_to == ""' 'CMD'                   # removed
+```
+
+The `changed_from` and `changed_to` names are `None` unless this edit changed that value. They accept only `NAME == "text"`, `"text" in NAME` and `NAME in ["a", "b"]`. `!=` and `not in` would also match every other edit, so KBTD refuses them. For "moved, but not into Done", write `task.status.changed and not task.status.changed_to == "Done"`.
 
 For example, `(owner.changed or tags.changed) and task.status == "In Progress"` runs once for an edit in that column, even if the edit changes both fields. Each edit is evaluated independently. Conditions run only on edits that emit at least one event in the table above.
 
 Earlier versions used `/\`, `\/`, `~` and `=`. A watcher saved with that syntax no longer runs. `kbtd watch list` names it, and edits report that it was skipped. Remove it and register it again in the new syntax.
 
-For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KBTD_EVENT.events` in the JSON payload lists the event names from the edit. In the payload, `before` and `after` hold the card's `id` and its `text` without the ID.
+For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KBTD_EVENT.events` in the JSON payload lists the event names from the edit. In the payload, `before` and `after` hold the card's `id`, its `text` without the ID, and its `description`.
 
 Raw title edits can trigger owner and tag changes. Creating or reordering a card, moving it within its column, saving an unchanged value, and reloading an external edit produce no events. For a move, the event's column and path give the task's new place, and `before.status` its old column. Watcher actions that call KBTD inherit a job ID that suppresses nested dispatch.
 

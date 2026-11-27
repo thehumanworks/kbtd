@@ -21,8 +21,11 @@ from kbtd.watchers import MAX_RECOVERIES, SkippedWatchers, Watchers
 DEADLINE = 20  # seconds; each worker start imports and launches DBOS
 
 
-EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened", "task.status.changed")
+EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened", "task.status.changed",
+          "task.description.changed")
 NAMES = ["codex", "Codex", "a b", 'q"x', "back\\slash", "ü", ""]
+DESCRIPTIONS = ["", "Fix the login", "fix\nlogin", 'Quote "x" here', "ü"]
+WORDS = ["login", "fix", "\n", '"x"', "ü", ""]
 COLUMNS = ["Backlog", "In Progress", 'Review "A" / B']
 
 # Stand-in for an agent service that accepts a durable idempotency key.
@@ -39,7 +42,7 @@ with closing(sqlite3.connect("launcher.db")) as db, db:
 def random_condition(rng, depth):
     """A random condition as (Python source, reference evaluator of (event names, payload))."""
     if depth == 0 or rng.random() < 0.3:
-        match rng.randrange(9):
+        match rng.randrange(12):
             case 0:
                 event = rng.choice(EVENTS)
                 return event, lambda kinds, payload: event in kinds
@@ -61,6 +64,22 @@ def random_condition(rng, depth):
             case 5:
                 field = rng.choice(["owners", "tags"])
                 return f"task.{field}", lambda kinds, payload: bool(payload["after"][field])
+            case 9:
+                word = rng.choice(WORDS)
+                return (f"{json.dumps(word)} in task.description",
+                        lambda kinds, payload: word in payload["after"]["description"])
+            case 10:
+                side, word = rng.choice(["from", "to"]), rng.choice(WORDS)
+                snapshot = "before" if side == "from" else "after"
+                return (f"{json.dumps(word)} in task.description.changed_{side}",
+                        lambda kinds, payload: "task.description.changed" in kinds
+                        and word in payload[snapshot]["description"])
+            case 11:
+                side, text = rng.choice(["from", "to"]), rng.choice(DESCRIPTIONS)
+                snapshot = "before" if side == "from" else "after"
+                return (f"task.description.changed_{side} == {json.dumps(text)}",
+                        lambda kinds, payload: "task.description.changed" in kinds
+                        and payload[snapshot]["description"] == text)
             case 6:
                 column = rng.choice(COLUMNS)
                 return (f"task.status.changed_to == {json.dumps(column)}",
@@ -144,10 +163,40 @@ class TriggerTests(unittest.TestCase):
             ('task.status.changed and not task.status.changed_to == "Done"', False, False),
             ('not task.status.changed_from == "Backlog"', False, True),
             ('task.status == "Done"', True, True),  # the column now, whatever changed
+            ('"Do" in task.status.changed_to', True, False),  # substring, as for task.status
         ]:
             with self.subTest(expr=expr):
                 self.assertEqual(compile_trigger(expr)(*moved), on_move)
                 self.assertEqual(compile_trigger(expr)(*edited), on_edit)
+
+    def test_description_names_match_whole_text_part_of_it_and_its_change(self):
+        described = (("task.description.changed",),
+                     {"before": {"description": "Users see a 500"},
+                      "after": {"description": "Users see a 500\nafter a password reset"}})
+        # Another edit of the same card: its description is the new one, unchanged.
+        owner = (("owner.changed",), {"before": {"description": described[1]["after"]["description"]},
+                                      "after": {"description": described[1]["after"]["description"]}})
+        cleared = (("task.description.changed",), {"before": {"description": "old"}, "after": {"description": ""}})
+        for expr, on_change, on_owner, on_clear in [
+            ("task.description.changed", True, False, True),
+            ('task.description == "Users see a 500\\nafter a password reset"', True, True, False),
+            ('"password" in task.description', True, True, False),
+            ('task.description == ""', False, False, True),
+            ('task.description.changed_from == "Users see a 500"', True, False, False),
+            ('"reset" in task.description.changed_to', True, False, False),
+            ('"reset" in task.description.changed_from', False, False, False),
+            ('task.description.changed_to == ""', False, False, True),  # removed
+            ('task.description.changed_from == ""', False, False, False),  # added
+            ('task.description.changed_from in ["old", "older"]', False, False, True),
+            ('task.description.changed and not "reset" in task.description.changed_to', False, False, True),
+        ]:
+            with self.subTest(expr=expr):
+                matcher = compile_trigger(expr)
+                self.assertEqual((matcher(*described), matcher(*owner), matcher(*cleared)),
+                                 (on_change, on_owner, on_clear))
+        # A malformed or older payload has no description to compare.
+        for payload in ({}, {"before": None, "after": {"description": 3}}):
+            self.assertFalse(compile_trigger('"x" in task.description.changed_to')(described[0], payload))
 
     def test_matches_a_reference_evaluator_on_random_conditions(self):
         rng = random.Random(20261126)
@@ -158,8 +207,9 @@ class TriggerTests(unittest.TestCase):
                      "done": rng.random() < 0.5}
             column, previous = rng.choice(COLUMNS), rng.choice(COLUMNS)
             payload = {"column": column,
-                       "before": {"owners": rng.sample(NAMES, rng.randrange(3)), "status": previous},
-                       "after": {**after, "status": column}}
+                       "before": {"owners": rng.sample(NAMES, rng.randrange(3)), "status": previous,
+                                  "description": rng.choice(DESCRIPTIONS)},
+                       "after": {**after, "status": column, "description": rng.choice(DESCRIPTIONS)}}
             with self.subTest(text=text, kinds=kinds, payload=payload):
                 self.assertEqual(compile_trigger(text)(kinds, payload), reference(kinds, payload))
 
@@ -210,10 +260,17 @@ class TriggerTests(unittest.TestCase):
             ("[x for x in task.tags]", "ListComp expressions"),
             ("owner.changed\nand tags.changed", "wrap a trigger that spans lines in parentheses"),
             ('task.status.changed_to = "Done"', "compare with =="),
-            ('task.status.changed_to != "Done"', "would also match edits that are not moves"),
-            ('task.status.changed_from not in ["Backlog"]', "would also match edits that are not moves"),
-            ("task.status.changed_to", "use task.status.changed to test for a move"),
-            ('"Do" in task.status.changed_to', "compare a moved column"),
+            ('task.status.changed_to != "Done"', "would also match every other edit"),
+            ('task.status.changed_from not in ["Backlog"]', "write task.status.changed and not"),
+            ("task.status.changed_to", "use task.status.changed to test for the change"),
+            ("task.status.changed_to in task.text", 'compare task.status.changed_to with == "text"'),
+            ('task.description.changed_to != ""', "write task.description.changed and not"),
+            ('"x" not in task.description.changed_from', "would also match every other edit"),
+            ("task.description.changed_from", "use task.description.changed to test for the change"),
+            ("task.description.changed_to == task.description.changed_from", "compare task.description"),
+            ('task.description.changed_to in "abc"', 'compare task.description.changed_to with'),
+            ('task.description == ["x"]', 'write task.description in ["x"]'),
+            ("task.descripton", "did you mean 'task.description'"),
             ("task.status.changes_to", "did you mean 'task.status.changed_to'"),
             ("not " * 100 + "owner.changed", "nested too deeply"),
             ("(" * 300 + "owner.changed" + ")" * 300, "too many nested parentheses"),

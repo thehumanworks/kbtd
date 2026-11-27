@@ -13,7 +13,7 @@ try:
 except ImportError as e:
     raise unittest.SkipTest("curses unavailable") from e
 
-from kbtd.tui import BoardUI, _apply_theme, _locate
+from kbtd.tui import BoardUI, _apply_theme, _locate, _paste_enter
 from kbtd.view import View
 
 
@@ -347,9 +347,11 @@ class TuiTests(unittest.TestCase):
             ui.key("\n")
 
         replace("D", "First\nSecond")
+        self.view.draw(ui)
+        self.assertFalse(any("Second" in text for text, _ in self.screen.entries.values()))
         ui.key("i")
         self.view.draw(ui)
-        self.assertTrue(any("Description: Second" in text for text, _ in self.screen.entries.values()))
+        self.assertIn("Second", [text for (_, x), (text, _) in self.screen.entries.items() if x == 13])
         ui.key("\x1b")
         replace("D", "Replacement")
         ui.key("u")
@@ -369,6 +371,119 @@ class TuiTests(unittest.TestCase):
         replace("D", "")
         replace("u", "")
         self.assertEqual(self.source.path.read_bytes(), original)
+
+    def test_task_view_shows_and_edits_the_task_properties(self):
+        self.source.path.write_text(
+            "<!-- kbtd next-id: KBT-0002 -->\n# Alpha\n## Queue\n"
+            "- [ ] KBT-0001 Publish guide @alice #docs\n  Description: Explain the release.\n"
+            "  Keep links relative.\n  - [ ] Review links\n## Done\n")
+        ui, view, screen = self.open(), self.view, self.screen
+        ui.select(0)
+
+        def shown():
+            view.draw(ui)
+            return {y: "".join(text for (row, _), (text, _) in sorted(screen.entries.items()) if row == y)
+                    for y, _ in screen.entries}
+
+        def go(field):
+            ui.field = [name for name, _ in ui.task_fields()].index(field)
+
+        def type_over(text):
+            for _ in ui.draft:
+                ui.key(curses.KEY_BACKSPACE)
+            for ch in text:
+                ui.key("\x0e" if ch == "\n" else ch)
+
+        self.assertFalse(any("Explain" in line for line in shown().values()))
+        ui.key("\n")
+        lines = shown()
+        self.assertEqual((ui.mode, lines[0], lines[2]), ("task", "[Boards]  /  Alpha  /  KBT-0001",
+                                                         "KBT-0001 · Task 1 · Queue"))
+        for label, value in [("Title", "Publish guide"), ("Owner", "@alice"), ("Tags", "#docs"),
+                             ("Description", "Explain the release."), ("Notes", "Keep links relative.")]:
+            self.assertTrue(any(line.split()[:1] == [label] and value in line for line in lines.values()), label)
+        self.assertTrue(lines[3].startswith(" Title") and screen.entries[3, 0][1] & curses.A_REVERSE)
+
+        with patch("kbtd.storage.Watchers.emit_many") as emit:
+            ui.key("\n")  # the title, without the ID and the trailing tokens
+            self.assertEqual((ui.mode, ui.draft), ("title", "Publish guide"))
+            type_over("Publish the guide")
+            self.assertIn("Publish the guide▏", shown()[3])
+            ui.key("\n")
+            ui.key("j")
+            ui.key("\n")  # Done
+            go("owner")
+            ui.key("\n")
+            type_over("bob")
+            ui.key("\n")
+            go("description")
+            ui.key("\n")
+            ui.key(curses.KEY_END)
+            type_over("Explain\nthe release")
+            ui.key(curses.KEY_UP)  # to the end of the first line
+            ui.key("!")
+            self.assertEqual(ui.draft, "Explain!\nthe release")
+            ui.key("\n")
+            ui.key("D")
+            ui.key("x")
+            ui.key("\x1b")  # cancel keeps the task view and the file
+            self.assertEqual((ui.mode, ui.card.description), ("task", "Explain!\nthe release"))
+            go("status")
+            ui.key(curses.KEY_RIGHT)
+            events = [call.args[0][0] for call in emit.call_args_list]
+        # A new title alone changes no owner, tag or checkbox, so it emits nothing.
+        self.assertEqual([kinds for kinds, _ in events], [
+            ("task.completed",), ("owner.changed",), ("task.description.changed",), ("task.status.changed",)])
+        self.assertEqual(events[2][1]["after"]["description"], "Explain!\nthe release")
+        self.assertEqual((ui.mode, ui.column.name, ui.card.text),
+                         ("task", "Done", "KBT-0001 Publish the guide @bob #docs"))
+        self.assertIn("- [x] KBT-0001 Publish the guide @bob #docs\n  Description: Explain!\n"
+                      "  Description: the release\n  Keep links relative.\n  - [ ] Review links",
+                      self.source.path.read_text())
+
+        go("child")
+        ui.key("\n")  # open the subtask
+        self.assertEqual((ui.card.text, shown()[2]), ("Review links", "Subtask 1.1 · Done"))
+        ui.key("m")  # its Markdown, then back
+        self.assertTrue(any("- [ ] Review links" in line for line in shown().values()))
+        ui.key("\x1b")
+        self.assertEqual(ui.mode, "task")
+        ui.key("\x1b")
+        self.assertEqual((ui.mode, ui.task_open, ui.card.text), ("browse", False, "Review links"))
+
+        # An external change keeps the view only while the same task is selected.
+        ui.key("k")
+        ui.key("i")
+        text = self.source.path.read_text()
+        self.source.path.write_text(text.replace("Keep links", "Keep all links"))
+        self.assertTrue(ui.poll())
+        self.assertEqual(ui.mode, "task")
+        self.source.path.write_text(text.replace("Publish the guide", "Renamed elsewhere"))
+        self.assertTrue(ui.poll())
+        self.assertEqual((ui.mode, ui.task_open), ("browse", False))
+
+    def test_a_line_break_inside_a_paste_does_not_save_the_draft(self):
+        class Input:
+            def __init__(self, waiting):
+                self.waiting = list(waiting)
+
+            def timeout(self, delay):
+                pass
+
+            def get_wch(self):
+                if not self.waiting:
+                    raise curses.error("no input")
+                return self.waiting.pop(0)
+
+        with patch("curses.unget_wch") as unget, patch("curses.ungetch") as ungetch:
+            self.assertEqual(_paste_enter(Input("x"), "description", "\n"), "\x0e")
+            unget.assert_called_once_with("x")
+            self.assertEqual(_paste_enter(Input([curses.KEY_LEFT]), "title", "\r"), " ")
+            ungetch.assert_called_once_with(curses.KEY_LEFT)
+            # Typed by hand, Enter saves; outside an editor it keeps its meaning.
+            self.assertEqual(_paste_enter(Input(""), "description", "\n"), "\n")
+            self.assertEqual(_paste_enter(Input("x"), "task", "\n"), "\n")
+            self.assertEqual(_paste_enter(Input("x"), "description", "a"), "a")
 
     def test_restore_by_path_and_name_not_section_index(self):
         ui = self.ui

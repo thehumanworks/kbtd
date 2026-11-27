@@ -120,6 +120,37 @@ class MarkdownTests(unittest.TestCase):
         self.assertEqual(doc.set_description(leaf, "  end ").serialize(),
                          text.replace("Description: keep me", "Description:   end "))
 
+    def test_title_notes_and_descriptions_given_when_adding(self):
+        text = ("<!-- kbtd next-id: KBT-0002 -->\r\n# T\r\n## A\r\n"
+                "- [ ] KBT-0001 Fix login @bob\t#docs\r\n  Description: Users see a 500\r\n  first note\r\n"
+                "  - [ ] Child\r\n    child note\r\n\r\n  last note\r\n## B")
+        doc = parse_markdown(text)
+        card = doc.sections[0].columns[0].cards[0]
+        self.assertEqual((card.plain_title, doc.notes(card)), ("Fix login", ("first note", "", "last note")))
+        self.assertIs(doc.card_at(card.children[0].start), card.children[0])
+        # The ID, the separator before the tokens and the tokens stay.
+        self.assertEqual(doc.set_title(card, "  Repair login ").serialize(),
+                         text.replace("Fix login @bob", "Repair login @bob"))
+        with self.assertRaisesRegex(ValueError, "needs a title"):
+            doc.set_title(card, " ")
+        bare = parse_markdown("# T\n## A\n- [ ] @bob #x\n- [ ] Plain\n")
+        tokens, plain = bare.sections[0].columns[0].cards
+        self.assertEqual(tokens.plain_title, "")
+        self.assertEqual(bare.set_title(tokens, "Named").sections[0].columns[0].cards[0].text, "Named @bob #x")
+        self.assertEqual(bare.set_title(plain, "Renamed").sections[0].columns[0].cards[1].text, "Renamed")
+
+        added = doc.add(doc.sections[0].columns[1], "New", "KBT", "one\ntwo")
+        self.assertTrue(added.serialize().endswith("## B\r\n- [ ] KBT-0002 New\r\n"
+                                                   "  Description: one\r\n  Description: two"))
+        parent = added.sections[0].columns[0].cards[0]
+        child = added.add_child(parent, "Kid", "why").sections[0].columns[0].cards[0].children[-1]
+        self.assertEqual((child.text, child.description), ("Kid", "why"))
+        fresh = parse_markdown("# T\n## A\n")
+        first = fresh.add(fresh.sections[0].columns[0], "First", "ABC", "said")
+        self.assertEqual(first.serialize(), "<!-- kbtd next-id: ABC-0002 -->\n# T\n## A\n"
+                                            "- [ ] ABC-0001 First\n  Description: said\n")
+        self.assertEqual(fresh.add(fresh.sections[0].columns[0], "x", "", None).serialize(), "# T\n## A\n- [ ] x\n")
+
     def test_due_uses_one_suffix_tag_and_preserves_legacy_dates_in_prose(self):
         text = "# S\r\n## C\r\n- [ ] before #due-2027-01-01 is prose @alice\t#due-2028-02-29 #ops "
         doc = parse_markdown(text)

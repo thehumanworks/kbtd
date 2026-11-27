@@ -51,6 +51,19 @@ Moving a task between columns used to emit no event, so `task.status == "Done"` 
 
 Only `==` and `in` compare the two column names. `None != "Done"` is true, so `!=` and `not in` would match every edit that is not a move. Registration refuses them and suggests `task.status.changed and not task.status.changed_to == "Done"`. Only the moved task emits the event: its subtasks change column with it, but a parent move would otherwise produce one job per descendant. The event payload names the task's new column and path, and every snapshot gains `status`. Moves inside one column remain reorders and emit nothing.
 
+## Amendment: description changes (2026-11-27)
+
+Editing a description used to emit no event. It now emits `task.description.changed`, and every snapshot gains `description`. The names follow the status ones:
+
+| Name | Value |
+| --- | --- |
+| `task.description.changed` | Whether this edit added, changed or removed the description |
+| `task.description` | The description after the edit, its lines joined by `\n`; `""` without one |
+| `task.description.changed_from` | The description before this edit, or `None` if the edit did not change it |
+| `task.description.changed_to` | The description after this edit, or `None` if the edit did not change it |
+
+`task.description` is an ordinary string, so `==` tests the whole text and `in` a part of it. The four `changed_from`/`changed_to` names share one type: a string only when the edit changed that value. They accept `NAME == "text"`, `NAME in ["a", "b"]` and, new for both, `"text" in NAME`. A substring of the old or new description is the common case, and refusing it for columns only would have been inconsistent with `"Do" in task.status`. A `None` operand makes any comparison false; `!=` and `not in` remain refused for the reason above.
+
 ## Migration
 
 Watchers saved with the old syntax no longer compile. Dispatch now compiles each watcher on its own. An invalid one is skipped, the other watchers still react, and the edit reports `Board saved. Skipped watcher 'name': invalid trigger`. `kbtd watch list` prints the reason on stderr. The old syntax is not translated automatically, because a translator would need the parser this change removes.

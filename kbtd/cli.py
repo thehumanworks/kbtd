@@ -77,6 +77,9 @@ def _parser() -> argparse.ArgumentParser:
             field.add_argument("--clear", action="store_true", help="remove this field")
         if command in ("add", "edit", "subtask"):
             sub.add_argument("text", help="one line of task text (quote spaces)")
+        if command in ("add", "subtask"):
+            sub.add_argument("--description", metavar="TEXT",
+                             help="also give the new task a description; may span lines")
     return parser
 
 
@@ -118,14 +121,14 @@ def _warn(doc: Document) -> None:
 def _change(source: BoardFile, doc: Document, args: argparse.Namespace, board: Section,
             column: Column) -> Document:
     if args.command == "add":
-        return doc.add(column, args.text, source.id_prefix(doc))
+        return doc.add(column, args.text, source.id_prefix(doc), args.description)
     if args.command in ("up", "down"):
         changed, _ = doc.reorder(column, args.card, -1 if args.command == "up" else 1)
         return changed
     card = column.resolve(args.card)
     match args.command:
         case "subtask":
-            return doc.add_child(card, args.text)
+            return doc.add_child(card, args.text, args.description)
         case "owner":
             return doc.set_owner(card, args.username)
         case "description":
@@ -165,7 +168,7 @@ def _task_command(source: BoardFile, doc: Document, args: argparse.Namespace) ->
     if changed is doc:
         return
     events = []
-    if args.command in ("toggle", "owner", "edit", "block", "unblock", "due"):
+    if args.command in ("toggle", "owner", "edit", "block", "unblock", "due", "description"):
         events = edit_events(doc, changed, s, c, args.card)
     elif args.command == "move":
         events = move_events(doc, changed, s, c, args.card, _index(board.columns, args.target, "column"))

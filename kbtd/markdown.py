@@ -48,6 +48,12 @@ class Card:
     def description(self) -> str:
         return "\n".join(self.description_lines)
 
+    @property
+    def plain_title(self) -> str:
+        """Title without the card ID and the trailing group of @owner and #tag tokens."""
+        end = self.metadata[0].start() if self.metadata else len(self.text)
+        return self.text[len(self.id):end].strip(" \t")
+
     @cached_property
     def metadata(self) -> tuple[re.Match[str], ...]:
         suffix = []
@@ -182,6 +188,22 @@ class Document:
                             f"give one a free ID such as {free} with 'kbtd edit'")
         return tuple(warnings)
 
+    def card_at(self, line: int) -> Card | None:
+        """The task, at any depth, whose checkbox is on ``line``."""
+        return next((card for card in self._cards() if card.start == line), None)
+
+    def notes(self, card: Card) -> tuple[str, ...]:
+        """Attached lines that are neither the description nor a subtask, without the task's indent."""
+        skip = {i for child in card.children for i in range(child.start, child.end)}
+        indent = " " * (card.indent + 2)
+        lines = [self.lines[i].rstrip("\r\n")
+                 for i in range(card.start + 1 + len(card.description_lines), card.end) if i not in skip]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        return tuple(line.removeprefix(indent) for line in lines)
+
     def _next_id(self, prefix: str) -> int:
         """Never below the counter, nor at or below an ID already on the board.
 
@@ -211,7 +233,13 @@ class Document:
                 lines[-1] += newline
         return parse_markdown("".join(lines))
 
-    def add(self, column: Column, text: str, prefix: str = "") -> Document:
+    def _described(self, line: int, description: str | None) -> Document:
+        """Give the task just inserted at ``line`` its description."""
+        card = self.card_at(line)
+        assert card is not None
+        return self.set_description(card, description) if description else self
+
+    def add(self, column: Column, text: str, prefix: str = "", description: str | None = None) -> Document:
         """Append a card. With an ID prefix, number it and advance the counter line.
 
         The counter line's own prefix wins over ``prefix``, which only starts a
@@ -222,7 +250,7 @@ class Document:
         prefix = self.id_prefix or prefix
         if not prefix:
             lines.insert(column.append_at, f"- [ ] {text}")
-            return self._updated(lines)
+            return self._updated(lines)._described(column.append_at, description)
         if not re.fullmatch(r"[A-Z]+", prefix):
             raise ValueError(f"invalid card ID prefix {prefix!r}; use capital letters A-Z")
         number = self._next_id(prefix)
@@ -243,19 +271,20 @@ class Document:
             if bom:
                 lines[0] = lines[0][1:]
             lines.insert(0, bom + counter)
-        return self._updated(lines)
+        at = column.append_at + (0 if self.counters else 1)
+        return self._updated(lines)._described(at, description)
 
-    def add_child(self, parent: Card, text: str) -> Document:
+    def add_child(self, parent: Card, text: str, description: str | None = None) -> Document:
         _validate_text(text)
         lines = list(self.lines)
         indent = parent.indent + 2
         lines.insert(parent.end, f"{' ' * indent}- [ ] {text}")
         updated = self._updated(lines)
         # Never report success if an unfinished fenced note swallowed the new line.
-        if not any(card.start == parent.end and card.indent == indent
-                   for s in updated.sections for col in s.columns for _, card in col.rows):
+        added = updated.card_at(parent.end)
+        if added is None or added.indent != indent:
             raise ValueError("cannot add subtask here; close the fenced note first")
-        return updated
+        return updated._described(parent.end, description)
 
     def toggle(self, card: Card) -> Document:
         lines = list(self.lines)
@@ -271,6 +300,17 @@ class Document:
         if card.id and not (given and given[1] == card.prefix):
             text = f"{card.id} {stripped}"
         return self._text(card, text)
+
+    def set_title(self, card: Card, title: str) -> Document:
+        """Replace the title between the card ID and the trailing @owner/#tag group."""
+        title = title.strip(" \t")
+        if not title:
+            raise ValueError("a task needs a title")
+        _validate_text(title)
+        end = card.metadata[0].start() if card.metadata else len(card.text)
+        head = card.text[:end]
+        gap = head[len(head.rstrip(" \t")):] or " "  # keep the separator before the tokens
+        return self.edit(card, title + (gap + card.text[end:] if end < len(card.text) else ""))
 
     def _text(self, card: Card, text: str) -> Document:
         if text == card.text:

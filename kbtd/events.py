@@ -8,6 +8,7 @@ from .markdown import Card, Column, Document
 type Event = tuple[str | tuple[str, ...], dict]
 
 STATUS_CHANGED = "task.status.changed"
+DESCRIPTION_CHANGED = "task.description.changed"
 
 
 def _fields(card: Card, column: Column) -> dict:
@@ -19,6 +20,7 @@ def _fields(card: Card, column: Column) -> dict:
         "owners": sorted(token[1:] for token in tokens if token.startswith("@")),
         "tags": sorted(token[1:] for token in tokens if token.startswith("#")),
         "status": column.name,
+        "description": card.description,
     }
 
 
@@ -48,6 +50,8 @@ def _events(old: Document, new: Document, section: int, source: tuple[int, str],
         triggers.append("tags.changed")
     if before["done"] != after["done"]:
         triggers.append("task.completed" if after["done"] else "task.reopened")
+    if before["description"] != after["description"]:
+        triggers.append(DESCRIPTION_CHANGED)
     # Compare positions, not names: two columns may share a name.
     if source[0] != dest[0]:
         triggers.append(STATUS_CHANGED)

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from .events import Event, edit_events, move_events
 from .markdown import Card, Column, Document, Section
 from .storage import BoardFile, SectionKey, SelectionStore, Snapshot
-from .view import View
+from .view import INPUT_MODES, View
 from .watchers import Watchers
 
 ENTER = ("\n", "\r", curses.KEY_ENTER)
@@ -18,6 +18,12 @@ RIGHT = ("l", curses.KEY_RIGHT)
 PAGE = 10  # lines per PgUp/PgDn in the job view
 
 JOB_MODES = ("jobs", "job")
+# Rows of the task view, before one row per subtask and an optional Notes row.
+TASK_FIELDS = ("title", "done", "status", "owner", "due", "blocked", "tags", "description")
+# Enter on a task-view row does what this board key does to the card.
+TASK_ENTER = {"done": " ", "owner": "o", "due": "u", "blocked": "B", "description": "D", "tags": "e"}
+# Board keys that also work in the task view.
+TASK_KEYS = (" ", "H", "L", "<", ">", "K", "J", "s", "D", "o", "B", "u", "e")
 # Each filter lists the job statuses it shows; None shows them all.
 JOB_FILTERS: dict[str, tuple[str, ...] | None] = {
     "all": None, "failed": ("failed", "interrupted"), "running": ("running",), "queued": ("queued",),
@@ -139,6 +145,8 @@ class BoardUI:
         self.notice = ""
         self.read_error = ""
         self.help_from = "browse"
+        self.task_open = False  # the task view is open on self.card
+        self.field = 0  # selected row of the task view
         self.watchers = Watchers(source.path)
         self.jobs = JobList(self.watchers)
         self._install(snapshot, self.state.load())
@@ -180,7 +188,19 @@ class BoardUI:
         column = self.column
         self.row = _clamp(self.row, len(column.rows) if column else 0)
 
-    def _install(self, snapshot: Snapshot, key: SectionKey | None) -> None:
+    def task_fields(self) -> list[tuple[str, Card | None]]:
+        """The task view's rows: (field, subtask) pairs; the subtask is set only for subtask rows."""
+        card = self.card
+        if card is None:
+            return []
+        rows: list[tuple[str, Card | None]] = [(name, None) for name in TASK_FIELDS]
+        rows += [("child", child) for child in card.children]
+        if self.doc.notes(card):
+            rows.append(("notes", None))
+        return rows
+
+    def _install(self, snapshot: Snapshot, key: SectionKey | None, saved: bool = False) -> None:
+        shown = self.card if self.task_open else None
         self.snapshot = snapshot
         self.section = None
         if key is not None:
@@ -190,9 +210,17 @@ class BoardUI:
             else:
                 self.state.save(None)
         self.drag = None
-        if self.mode not in JOB_MODES:  # the job view does not show the board
-            self.mode = "browse"
         self._fit()
+        if self.mode in JOB_MODES:  # the job view does not show the board
+            return
+        # Our own save keeps the task view open (a move then selects the card in
+        # its new column); an external change keeps it only while the same task
+        # is still at the selected position.
+        now = self.card
+        if self.task_open and (saved or now and shown and (now.text, now.indent) == (shown.text, shown.indent)):
+            self.mode = "task"
+        else:
+            self.mode, self.task_open = "browse", False
 
     def select(self, section: int | None) -> None:
         self.section = section
@@ -213,7 +241,7 @@ class BoardUI:
             self.read_error = str(e)
             self.drag = None
             if self.mode not in JOB_MODES:
-                self.mode = "browse"
+                self.mode, self.task_open = "browse", False
             return changed
         self.read_error = ""
         self.notice = " · ".join(["Reloaded from disk", *self.doc.id_warnings[:1]])
@@ -231,10 +259,10 @@ class BoardUI:
 
     def _save(self, document: Document, events: Sequence[Event] = ()) -> bool:
         if document is self.doc:
-            self.mode, self.notice = "browse", "Unchanged"
+            self.mode, self.notice = "task" if self.task_open else "browse", "Unchanged"
             return True
         try:
-            self._install(self.source.save(document, events), self._key())
+            self._install(self.source.save(document, events), self._key(), saved=True)
         except (OSError, UnicodeError) as e:
             self.notice = f"Not saved: {e}"
             return False
@@ -259,7 +287,7 @@ class BoardUI:
 
     def _input(self, key: str | int) -> None:
         if key == "\x1b":
-            self.mode = "browse"
+            self.mode = "task" if self.task_open else "browse"
         elif key in ENTER:
             column, card = self.column, self.card
             try:
@@ -271,13 +299,16 @@ class BoardUI:
                         if added and added.id and self.notice == "Saved":
                             self.notice = f"Added {added.id}"
                 elif self.mode == "subtask" and card:
-                    if self._save(self.doc.add_child(card, self.draft)) and self.column:
+                    # The task view stays on the parent; the board selects the new child.
+                    if self._save(self.doc.add_child(card, self.draft)) and self.column and not self.task_open:
                         self.row = next((i for i, (_, child) in enumerate(self.column.rows)
                                          if child.start == card.end), self.row)
                 elif self.mode == "owner" and card:
                     self._save_edit(self.doc.set_owner(card, self.draft or None))
                 elif self.mode == "description" and card:
-                    self._save(self.doc.set_description(card, self.draft))
+                    self._save_edit(self.doc.set_description(card, self.draft))
+                elif self.mode == "title" and card:
+                    self._save_edit(self.doc.set_title(card, self.draft))
                 elif self.mode == "due" and card:
                     self._save_edit(self.doc.set_due(card, self.draft or None))
                 elif card:
@@ -301,9 +332,89 @@ class BoardUI:
         elif self.mode == "description" and key == "\x0e":
             self.draft = self.draft[:self.caret] + "\n" + self.draft[self.caret:]
             self.caret += 1
+        elif self.mode == "description" and key in (curses.KEY_UP, curses.KEY_DOWN):
+            # Same column on the previous or next line of a multi-line draft.
+            lines = self.draft.split("\n")
+            before = self.draft[:self.caret]
+            line, column = before.count("\n"), len(before) - before.rfind("\n") - 1
+            target = line + (1 if key == curses.KEY_DOWN else -1)
+            if 0 <= target < len(lines):
+                self.caret = sum(len(text) + 1 for text in lines[:target]) + min(column, len(lines[target]))
         elif isinstance(key, str) and key.isprintable():
             self.draft = self.draft[: self.caret] + key + self.draft[self.caret :]
             self.caret += len(key)
+
+    def _open_task(self) -> None:
+        self.mode, self.task_open, self.field = "task", True, 0
+
+    def _task_key(self, key: str | int) -> None:
+        card, fields = self.card, self.task_fields()
+        if card is None:
+            self.mode, self.task_open = "browse", False
+            return
+        self.field = _clamp(self.field, len(fields))
+        name, child = fields[self.field]
+        if key == "\x1b":
+            self.mode, self.task_open = "browse", False
+        elif key == "?":
+            self.help_from, self.mode = "task", "help"
+        elif key in UP + DOWN:
+            self.field = _clamp(self.field + (1 if key in DOWN else -1), len(fields))
+        elif key in LEFT + RIGHT:
+            if name == "status":
+                self._card_key(card, "L" if key in RIGHT else "H")
+        elif key == "m":
+            self.mode, self.detail_scroll = "detail", 0
+        elif key in ENTER:
+            if child is not None and self.column:
+                self.row = next(i for i, (_, row) in enumerate(self.column.rows) if row.start == child.start)
+                self.field = 0
+            elif name == "notes":
+                self.mode, self.detail_scroll = "detail", 0
+            elif name == "status":
+                self.notice = "←/→ moves the task to the previous or next column"
+            elif name == "title":
+                self.mode, self.draft, self.caret = "title", card.plain_title, len(card.plain_title)
+            else:
+                self._card_key(card, TASK_ENTER[name])
+        elif key in TASK_KEYS:
+            self._card_key(card, key)
+
+    def _card_key(self, card: Card, key: str | int) -> None:
+        """Keys that act on the selected card, from the board or the task view."""
+        if key == " ":
+            self._save_edit(self.doc.toggle(card))
+        elif key in ("H", "<", "L", ">"):
+            self._move(self.col, self.row, self.col + (1 if key in ("L", ">") else -1))
+        elif key in ("K", "J") and self.column:
+            path = self.column.rows[self.row][0]
+            changed, new_path = self.doc.reorder(self.column, path, -1 if key == "K" else 1)
+            if self._save(changed) and self.column:
+                self.row = next((i for i, (p, _) in enumerate(self.column.rows)
+                                 if p == new_path), self.row)
+        elif key == "s":
+            self.mode, self.draft, self.caret = "subtask", "", 0
+        elif key == "D":
+            self.draft = card.description
+            self.mode, self.caret = "description", len(self.draft)
+        elif key in ("o", "B", "u"):
+            try:
+                if key == "B":
+                    self._save_edit(self.doc.set_blocked(card, not card.blocked))
+                elif key == "u":
+                    self.draft = card.due
+                    self.mode, self.caret = "due", len(self.draft)
+                else:
+                    owner = card.field("owner")
+                    self.draft = owner[0][1:] if owner else ""
+                    self.mode, self.caret = "owner", len(self.draft)
+            except ValueError as e:
+                self.notice = str(e)
+        elif key == "e":
+            # The ID is kept on save, so only the title after it is editable.
+            self.mode, self.draft, self.caret = "edit", card.title, len(card.title)
+        elif key == "d":
+            self.mode = "delete"
 
     def _open_jobs(self) -> None:
         self.mode, self.jobs.detail = "jobs", None
@@ -375,7 +486,7 @@ class BoardUI:
         self.notice = ""
         if key == curses.KEY_RESIZE:
             return True
-        if self.mode in ("add", "edit", "subtask", "owner", "description", "due"):
+        if self.mode in INPUT_MODES:
             self._input(key)
         elif key == "q":
             return False
@@ -385,7 +496,9 @@ class BoardUI:
             if key in UP + DOWN:
                 self.detail_scroll = max(0, self.detail_scroll + (1 if key in DOWN else -1))
             else:
-                self.mode = "browse"
+                self.mode = "task" if self.task_open else "browse"
+        elif self.mode == "task":
+            self._task_key(key)
         elif self.mode == "help":
             self.mode, self.help_from = self.help_from, "browse"
         elif self.mode == "delete":
@@ -417,41 +530,10 @@ class BoardUI:
         elif key == "a" and self.column:
             self.mode, self.draft, self.caret = "add", "", 0
         elif card := self.card:
-            if key in (*ENTER, " "):
-                self._save_edit(self.doc.toggle(card))
-            elif key in ("H", "<", "L", ">"):
-                self._move(self.col, self.row, self.col + (1 if key in ("L", ">") else -1))
-            elif key in ("K", "J") and self.column:
-                path = self.column.rows[self.row][0]
-                changed, new_path = self.doc.reorder(self.column, path, -1 if key == "K" else 1)
-                if self._save(changed) and self.column:
-                    self.row = next((i for i, (p, _) in enumerate(self.column.rows)
-                                     if p == new_path), self.row)
-            elif key == "s":
-                self.mode, self.draft, self.caret = "subtask", "", 0
-            elif key == "i":
-                self.mode, self.detail_scroll = "detail", 0
-            elif key == "D":
-                self.draft = card.description
-                self.mode, self.caret = "description", len(self.draft)
-            elif key in ("o", "B", "u"):
-                try:
-                    if key == "B":
-                        self._save_edit(self.doc.set_blocked(card, not card.blocked))
-                    elif key == "u":
-                        self.draft = card.due
-                        self.mode, self.caret = "due", len(self.draft)
-                    else:
-                        owner = card.field("owner")
-                        self.draft = owner[0][1:] if owner else ""
-                        self.mode, self.caret = "owner", len(self.draft)
-                except ValueError as e:
-                    self.notice = str(e)
-            elif key == "e":
-                # The ID is kept on save, so only the title after it is editable.
-                self.mode, self.draft, self.caret = "edit", card.title, len(card.title)
-            elif key == "d":
-                self.mode = "delete"
+            if key in (*ENTER, "i"):
+                self._open_task()
+            else:
+                self._card_key(card, key)
         return True
 
     def mouse(self, view: View, x: int, y: int, buttons: int) -> None:
@@ -506,6 +588,33 @@ def _apply_theme(screen: curses.window, theme: str) -> int:
     return curses.A_DIM
 
 
+def _pasted(screen: curses.window) -> bool:
+    """Whether more input is already waiting: a paste, not a key typed by hand."""
+    screen.timeout(0)
+    try:
+        key = screen.get_wch()
+    except curses.error:
+        return False
+    finally:
+        screen.timeout(250)
+    if isinstance(key, str):
+        curses.unget_wch(key)
+    else:
+        curses.ungetch(key)
+    return True
+
+
+def _paste_enter(screen: curses.window, mode: str, key: str | int | None) -> str | int | None:
+    """A line break inside a paste continues the draft instead of saving it.
+
+    Otherwise the rest of the paste would run as commands, such as Space
+    toggling the task. A description keeps the line break; one-line fields get a space.
+    """
+    if key in ENTER and mode in INPUT_MODES and _pasted(screen):
+        return "\x0e" if mode == "description" else " "
+    return key
+
+
 def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot, theme: str) -> None:
     screen.timeout(250)
     if hasattr(curses, "set_escdelay"):
@@ -524,7 +633,7 @@ def _run(screen: curses.window, source: BoardFile, snapshot: Snapshot, theme: st
     view.draw(ui)
     while True:
         try:
-            key = screen.get_wch()
+            key = _paste_enter(screen, ui.mode, screen.get_wch())
         except curses.error:  # polling timeout
             key = None
         changed = ui.poll()

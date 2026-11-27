@@ -250,6 +250,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(names), 5)
         self.assertEqual(names[0], "in-done")
 
+    def test_description_from_add_and_its_edits_trigger_watchers(self):
+        self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
+        os.environ.pop("KBTD_JOB_ID", None)
+        self.enterContext(patch.object(Watchers, "_start_worker"))
+        path = str(self.file)
+        self.file.write_text("# Tasks\n## Backlog\n")
+        self.cli("-f", path, "add", "1", "1", "Fix login", "--description", "Users see a 500")
+        self.cli("-f", path, "subtask", "1", "1", "1", "Add a test", "--description", "cover\nreset")
+        self.assertEqual(self.cli("-f", path, "description", "1", "1", "1.1"), "cover\nreset\n")
+        for name, condition in [("any", "task.description.changed"),
+                                ("reset", '"reset" in task.description.changed_to'),
+                                ("was-500", 'task.description.changed_from == "Users see a 500"'),
+                                ("cleared", 'task.description.changed_to == ""'),
+                                ("mentions", '"500" in task.description')]:
+            self.cli("-f", path, "watch", "add", name, condition, "exit 0")
+        watchers = Watchers(self.file)
+
+        def new_jobs(*args):
+            before = {job["id"] for job in watchers.jobs()}
+            self.cli("-f", path, *args)
+            return sorted(job["name"] for job in watchers.jobs() if job["id"] not in before)
+
+        self.assertEqual(new_jobs("description", "1", "1", "1", "Users see a 500\nafter a reset"),
+                         ["any", "mentions", "reset", "was-500"])
+        self.assertEqual(new_jobs("description", "1", "1", "1", "Users see a 500\nafter a reset"), [])
+        self.assertEqual(new_jobs("owner", "1", "1", "1", "sam"), ["mentions"])
+        self.assertEqual(new_jobs("description", "1", "1", "1", "--clear"), ["any", "cleared"])
+        [job] = [job for job in watchers.jobs() if job["name"] == "cleared"]
+        event = watchers.job(job["id"])["event"]
+        self.assertEqual((event["events"], event["before"]["description"], event["after"]["description"]),
+                         (["task.description.changed"], "Users see a 500\nafter a reset", ""))
+        self.assertEqual(new_jobs("description", "1", "1", "1.1", "--clear"), ["any", "cleared"])
+
     def test_invalid_stored_trigger_is_reported_and_skipped(self):
         self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
         os.environ.pop("KBTD_JOB_ID", None)

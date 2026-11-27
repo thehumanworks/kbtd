@@ -9,10 +9,18 @@ import unicodedata
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .markdown import Column
+from .markdown import Card, Column
 
 if TYPE_CHECKING:
     from .tui import BoardUI
+
+# Modes that type into ui.draft.
+INPUT_MODES = ("add", "edit", "subtask", "owner", "description", "due", "title")
+# Input modes the task view shows in place, and the row each one edits.
+IN_PLACE = {"title": "title", "edit": "title", "owner": "owner", "due": "due", "description": "description"}
+LABELS = {"title": "Title", "done": "Done", "status": "Column", "owner": "Owner", "due": "Due",
+          "blocked": "Blocked", "tags": "Tags", "description": "Description", "notes": "Notes"}
+LABEL_WIDTH = 13
 
 
 def _clip(text: str, width: int, pad: bool = False) -> str:
@@ -166,6 +174,88 @@ class View:
         for y, line in enumerate(lines[ui.detail_scroll:ui.detail_scroll + capacity], 3):
             self._put(y, 0, line)
 
+    def _value(self, ui: BoardUI, card: Card, name: str, child: Card | None,
+               selected: bool) -> tuple[list[str], int]:
+        """A task-view row's text lines and attribute."""
+        def token(kind: str, show) -> tuple[list[str], int]:
+            try:
+                match = card.field(kind)
+            except ValueError:
+                return [f"several {kind}s: press e to edit the task line"], curses.A_BOLD
+            return ([show(match[0])], 0) if match else (["—"], self.muted)
+
+        if child is not None:
+            return [f"[{'x' if child.done else ' '}] {child.text}"], self.muted if child.done else 0
+        match name:
+            case "title":
+                return [card.plain_title or "—"], curses.A_BOLD if card.plain_title else self.muted
+            case "done":
+                return ["[x] done" if card.done else "[ ] open"], 0
+            case "status":
+                column = ui.column
+                assert column is not None
+                hint = "   (moves with its parent)" if card.indent else "   ←/→ move"
+                return [column.name + (hint if selected else "")], 0
+            case "owner":
+                return token("owner", lambda text: text)
+            case "due":
+                return token("due date", lambda text: text.removeprefix("#due-"))
+            case "blocked":
+                return (["BLOCKED"], curses.A_BOLD) if card.blocked else (["no"], self.muted)
+            case "tags":
+                tags = [m[0] for m in card.metadata if m[0].startswith("#")
+                        and m[0] != "#blocked" and m not in card.date_tokens]
+                return ([" ".join(tags)], 0) if tags else (["—"], self.muted)
+            case "description":
+                return (list(card.description_lines), 0) if card.description_lines else (["—"], self.muted)
+            case _:  # notes
+                return list(ui.doc.notes(card)), self.muted
+
+    def _task(self, ui: BoardUI) -> None:
+        card, column = ui.card, ui.column
+        assert card is not None and column is not None
+        path = column.rows[ui.row][0]
+        kind = "Subtask" if card.indent else "Task"
+        self._put(2, 0, " · ".join(filter(None, [card.id, f"{kind} {path}", column.name])), curses.A_BOLD)
+        width = max(1, self.width - LABEL_WIDTH)
+        editing = IN_PLACE.get(ui.mode) if ui.mode in INPUT_MODES else None
+        fields = ui.task_fields()
+        lines: list[tuple[str, str, int, bool]] = []  # label, text, attribute, selected
+        focus = (0, 0)  # first and last line to keep on screen
+        for i, (name, child) in enumerate(fields):
+            if child is not None and fields[i - 1][1] is None:
+                lines += [("", "", 0, False), ("Subtasks", "", curses.A_BOLD, False)]
+            if name == "notes":
+                lines.append(("", "", 0, False))
+            selected = i == ui.field
+            first = len(lines)
+            if editing == name:
+                # The draft with its caret, wrapped; keep the caret's line visible.
+                text = ui.draft[:ui.caret] + "▏" + ui.draft[ui.caret:]
+                parts = [part for line in text.split("\n")
+                         for part in textwrap.wrap(line, width=width, drop_whitespace=False) or [""]]
+                caret = next(j for j, part in enumerate(parts) if "▏" in part)
+                focus = (first + caret, first + caret)
+                label = "Task line" if ui.mode == "edit" else LABELS[name]
+                lines += [(label if j == 0 else "", part, curses.A_BOLD, False) for j, part in enumerate(parts)]
+                continue
+            values, attr = self._value(ui, card, name, child, selected)
+            parts = [part for value in values
+                     for part in textwrap.wrap(value, width=width, drop_whitespace=False) or [""]]
+            label = "" if child is not None else LABELS[name]
+            lines += [(label if j == 0 else "", part, attr, selected and j == 0) for j, part in enumerate(parts)]
+            if selected and not editing:
+                focus = (first, len(lines) - 1)
+        capacity = self.height - 5
+        top = max(0, focus[1] - capacity + 1)
+        top = min(top, focus[0])
+        for y, (label, text, attr, selected) in enumerate(lines[top:top + capacity], 3):
+            if selected:
+                self._put(y, 0, f" {label:<{LABEL_WIDTH - 1}}{text}", attr | curses.A_REVERSE, pad=True)
+            else:
+                self._put(y, 0, f" {label:<{LABEL_WIDTH - 1}}", self.muted if label != "Subtasks" else attr)
+                self._put(y, LABEL_WIDTH, text, attr)
+
     def _jobs(self, ui: BoardUI) -> None:
         jobs = ui.jobs
         shown = jobs.shown
@@ -241,7 +331,12 @@ class View:
 
     def _footer(self, ui: BoardUI) -> None:
         status = ui.notice
-        if ui.mode in ("add", "edit", "subtask", "owner", "description", "due"):
+        if ui.task_open and ui.mode in IN_PLACE:
+            hints = "Enter: save   Esc: cancel   ←/→: move caret"
+            if ui.mode == "description":
+                hints += "   Ctrl-N: new line   ↑/↓: line"
+            self._put(self.height - 2, 0, status, curses.A_BOLD)
+        elif ui.mode in INPUT_MODES:
             label = {"add": "New card: ", "edit": "Edit: ", "subtask": "New child: ",
                      "owner": "Owner: ", "description": "Description: ", "due": "Due: "}[ui.mode]
             if ui.mode == "edit" and ui.card and ui.card.id:
@@ -261,6 +356,8 @@ class View:
                 hints = "y: delete   any other key: cancel"
             elif ui.mode == "detail":
                 hints = "↑/↓: scroll   Esc: back   q: quit"
+            elif ui.mode == "task":
+                hints = "↑/↓: field   Enter: edit   ←/→: column   Space: done   m: Markdown   Esc: back"
             elif ui.mode == "jobs":
                 status = status or self._job_status(ui)
                 hints = "↑/↓: job   Enter: details   r: retry   c: cancel   g: go to card   f: filter   Esc: back"
@@ -277,7 +374,8 @@ class View:
                     if ui.card:
                         title = ui.card.text if ui.show_dates else ui.card.text_without_dates
                         status += f" · Task {ui.column.rows[ui.row][0]}: {title}"
-                hints = "?: help   q: quit   w: jobs   arrows: focus   Space: toggle   K/J: priority   H/L: column   a/e/d: add/edit/delete"
+                hints = ("?: help   q: quit   w: jobs   arrows: focus   Enter: open   Space: toggle   "
+                         "K/J: priority   H/L: column   a/e/d: add/edit/delete")
             self._put(self.height - 2, 0, status, curses.A_BOLD)
         self._put(self.height - 1, 0, hints, curses.A_REVERSE, pad=True)
 
@@ -293,21 +391,24 @@ class View:
             title = f"[Boards]  /  {ui.board.name}" if ui.board else "KBTD  /  Boards"
             if ui.mode in ("jobs", "job"):
                 title += "  /  Jobs"
+            elif ui.task_open and ui.card and ui.column:
+                title += "  /  " + (ui.card.id or f"Task {ui.column.rows[ui.row][0]}")
             self._put(0, 0, title, curses.A_BOLD)
             self._put(1, 0, str(ui.source.path), self.muted)
             if ui.mode == "help":
                 for y, line in enumerate((
                     "Keyboard & mouse", "↑/↓ or k/j    Select board or card",
-                    "←/→ or h/l    Select column", "Enter         Open board or toggle card",
+                    "←/→ or h/l    Select column", "Enter / i     Open board or task",
                     "Space / click Toggle completion", "H/L or </>    Move card one column left/right",
                     "K/J           Move task up/down among siblings",
                     "Drag & drop   Append card to another column", "a / e / d     Add, edit or delete card",
                     "s             Add subtask to selection", "o             Owner (empty clears)",
-                    "B             Toggle #blocked", "i / D         Inspect task / edit description",
+                    "B / D         Toggle #blocked / edit description",
+                    "Task view     ↑/↓ field, Enter edit, ←/→ column, m Markdown",
                     "u / v         Edit due date / show or hide dates",
                     "w             Watcher jobs: Enter details, r retry, c cancel,",
                     "              g go to card, f filter, Esc back",
-                    "b / Esc       Back to board picker", "q             Quit",
+                    "b / Esc / q   Back to board picker / quit",
                 ), 2):
                     if y < self.height - 2:
                         self._put(y, 0, line, curses.A_BOLD if y == 2 else 0)
@@ -317,6 +418,8 @@ class View:
                 self._job(ui)
             elif ui.mode == "detail":
                 self._detail(ui)
+            elif ui.task_open and ui.card and not ui.read_error:
+                self._task(ui)
             elif ui.read_error:
                 self._put(2, 0, "Cannot read file; waiting for it to become available.", curses.A_BOLD)
                 self._put(3, 0, ui.read_error)
