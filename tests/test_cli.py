@@ -246,7 +246,7 @@ class CliTests(unittest.TestCase):
         watchers = Watchers(self.file)
         together = "owner.changed and tags.changed"
         either = '(owner.changed and "codex" in task.owners) or (tags.changed and "docs" in task.tags)'
-        assigned = 'owner.changed and "codex" in task.owners and task.status == "Backlog"'
+        assigned = '"codex" in owner.added and task.status == "Backlog"'
         for name, condition in [("both", together), ("either", either), ("assign", assigned),
                                 ("z-owner", "owner.changed"), ("a-tags", "tags.changed")]:
             self.cli("-f", path, "watch", "add", name, condition, "exit 0")
@@ -277,3 +277,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual((event["events"], event["trigger"], event["column"], event["path"]),
                          (["owner.changed", "tags.changed"], together, "Backlog", "1.1"))
         self.assertEqual(event["after"]["owners"], ["codex"])
+
+    def test_owner_transition_watchers_with_multiple_owners(self):
+        self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
+        os.environ.pop("KBTD_JOB_ID", None)
+        self.enterContext(patch.object(Watchers, "_start_worker"))
+        self.file.write_text("# Tasks\n## Backlog\n- [ ] Work\n")
+        path = str(self.file)
+        watchers = Watchers(self.file)
+        for name, trigger in [
+            ("assign", '"codex" in owner.added and task.status == "Backlog"'),
+            ("broad", 'owner.changed and "codex" in task.owners'),
+            ("remove", '"codex" in owner.removed'),
+            ("handoff", '"sam" in owner.removed and "codex" in owner.added'),
+        ]:
+            self.cli("-f", path, "watch", "add", name, trigger, "exit 0")
+
+        last_id = 0
+        for title, expected in [
+            ("Work @codex", ["assign", "broad"]),
+            ("Work @codex @sam", ["broad"]),
+            ("Work @codex", ["broad"]),
+            ("Work @sam", ["remove"]),
+            ("Work @sam @bea", []),
+            ("Work @bea @codex @alex #docs", ["assign", "broad", "handoff"]),
+            ("Retitled @alex @bea @codex @codex #docs", []),
+            ("Retitled @alex @bea @codex #review", []),
+            ("Retitled @alex @bea", ["remove"]),
+            ("Retitled @codex @bea @alex", ["assign", "broad"]),
+            ("Retitled", ["remove"]),
+        ]:
+            with self.subTest(title=title):
+                self.cli("-f", path, "edit", "1", "1", "1", title)
+                jobs = [job for job in reversed(watchers.jobs()) if job["id"] > last_id]
+                self.assertEqual([job["name"] for job in jobs], expected)
+                if jobs:
+                    last_id = jobs[-1]["id"]

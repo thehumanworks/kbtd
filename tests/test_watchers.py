@@ -4,13 +4,14 @@ import random
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import chdir
+from contextlib import chdir, closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,32 +25,55 @@ EVENTS = ("owner.changed", "tags.changed", "task.completed", "task.reopened")
 NAMES = ["codex", "Codex", "a b", 'q"x', "back\\slash", "ü", ""]
 COLUMNS = ["Backlog", "In Progress", 'Review "A" / B']
 
+# Stand-in for an agent service that accepts a durable idempotency key.
+RECORD_LAUNCH = """\
+import os, sqlite3
+from contextlib import closing
+with closing(sqlite3.connect("launcher.db")) as db, db:
+    db.execute("CREATE TABLE IF NOT EXISTS runs (board TEXT, job TEXT, event TEXT, PRIMARY KEY (board, job))")
+    db.execute("INSERT OR IGNORE INTO runs VALUES (?, ?, ?)",
+               (os.environ["KBTD_BOARD"], os.environ["KBTD_JOB_ID"], os.environ["KBTD_EVENT"]))
+"""
+
 
 def random_condition(rng, depth):
     """A random condition as (Python source, reference evaluator)."""
     if depth == 0 or rng.random() < 0.3:
-        match rng.randrange(6):
+        match rng.randrange(7):
             case 0:
                 event = rng.choice(EVENTS)
-                return event, lambda kinds, after, column: event in kinds
+                return event, lambda kinds, payload: event in kinds
             case 1:
                 field, name = rng.choice(["owners", "tags"]), rng.choice(NAMES)
                 op = rng.choice(["in", "not in"])
                 return (f"{json.dumps(name)} {op} task.{field}",
-                        lambda kinds, after, column: (name in after[field]) == (op == "in"))
+                        lambda kinds, payload: (name in payload["after"][field]) == (op == "in"))
             case 2:
                 column, op = rng.choice(COLUMNS), rng.choice(["==", "!="])
                 return (f"task.status {op} {json.dumps(column)}",
-                        lambda kinds, after, column_now: (column_now == column) == (op == "=="))
+                        lambda kinds, payload: (payload["column"] == column) == (op == "=="))
             case 3:
                 options = rng.sample(COLUMNS, 2)
                 return (f"task.status in {json.dumps(options)}",
-                        lambda kinds, after, column: column in options)
+                        lambda kinds, payload: payload["column"] in options)
             case 4:
-                return "task.done", lambda kinds, after, column: after["done"]
-            case _:
+                return "task.done", lambda kinds, payload: payload["after"]["done"]
+            case 5:
                 field = rng.choice(["owners", "tags"])
-                return f"task.{field}", lambda kinds, after, column: bool(after[field])
+                return f"task.{field}", lambda kinds, payload: bool(payload["after"][field])
+            case _:
+                name, field = rng.choice(NAMES), rng.choice(["added", "removed"])
+
+                def transitioned(kinds, payload):
+                    was_owner = name in payload["before"]["owners"]
+                    is_owner = name in payload["after"]["owners"]
+                    if "owner.changed" not in kinds:
+                        return False
+                    if field == "added":
+                        return is_owner and not was_owner
+                    return was_owner and not is_owner
+
+                return f"{json.dumps(name)} in owner.{field}", transitioned
     op = rng.choice(["and", "or", "not"])
     if op == "not":
         text, inner = random_condition(rng, depth - 1)
@@ -106,10 +130,29 @@ class TriggerTests(unittest.TestCase):
             kinds = tuple(event for event in EVENTS if rng.random() < 0.5)
             after = {"owners": rng.sample(NAMES, rng.randrange(3)), "tags": rng.sample(NAMES, rng.randrange(3)),
                      "done": rng.random() < 0.5}
-            column = rng.choice(COLUMNS)
-            with self.subTest(text=text, kinds=kinds, after=after, column=column):
-                self.assertEqual(compile_trigger(text)(kinds, {"column": column, "after": after}),
-                                 reference(kinds, after, column))
+            payload = {"column": rng.choice(COLUMNS), "before": {"owners": rng.sample(NAMES, rng.randrange(3))},
+                       "after": after}
+            with self.subTest(text=text, kinds=kinds, payload=payload):
+                self.assertEqual(compile_trigger(text)(kinds, payload), reference(kinds, payload))
+
+    def test_owner_differences_use_both_snapshots(self):
+        payload = {"before": {"owners": ["sam", "Codex", "sam", "alex"]},
+                   "after": {"owners": ["codex", "bea", "alex", "bea"]}}
+        kinds = ("owner.changed", "tags.changed")
+        for expr in ['owner.added == ["bea", "codex"]', 'owner.removed == ["Codex", "sam"]',
+                     'owner.added and owner.removed', '"sam" in owner.removed and "codex" in owner.added',
+                     '"alex" not in owner.added and "alex" not in owner.removed']:
+            with self.subTest(expr=expr):
+                self.assertTrue(compile_trigger(expr)(kinds, payload))
+        no_delta = compile_trigger("owner.added == [] and owner.removed == []")
+        self.assertTrue(no_delta(("tags.changed",), payload))
+        for invalid in [None, {}, {"owners": "codex"}, {"owners": [42]}]:
+            for side in ("before", "after"):
+                with self.subTest(side=side, invalid=invalid):
+                    self.assertTrue(no_delta(kinds, {**payload, side: invalid}))
+        for missing in ("before", "after"):
+            self.assertTrue(no_delta(kinds, {side: data for side, data in payload.items() if side != missing}))
+        self.assertTrue(compile_trigger("owner.changed")(kinds, {}))
 
     def test_mistakes_are_rejected_with_a_reason(self):
         for expr, reason in [
@@ -118,7 +161,12 @@ class TriggerTests(unittest.TestCase):
             (r"owner.changed /\ tags.changed", "use and, or, not"),
             ("~owner.changed", "use 'not'"),
             ('owner.changed and "codex"', "fixed value is not a condition"),
-            ('task.owners == "codex"', 'write "name" in task.owners'),
+            ('task.owners == "codex"', 'write "codex" in task.owners'),
+            ('owner.added == "codex"', 'write "codex" in owner.added'),
+            ('task.status == ["Backlog"]', 'write task.status in ["Backlog"]'),
+            ('owner.assigned("codex")', "Call expressions are not allowed"),
+            ("owner.removed[0]", "Subscript expressions are not allowed"),
+            ("owner.added.__class__", "unknown name"),
             ('"a" == "a"', "two fixed values"),
             ("True", "fixed value"),
             ("task.status", "is a string, not a condition"),
@@ -250,17 +298,36 @@ class WatchersTests(unittest.TestCase):
         self.assertEqual(done["event"], json.loads(event))
         self.assertEqual(sorted(done["output"].splitlines()), ["stderr line", "stdout line"])
 
+    def set_owner(self, value):
+        subprocess.run([sys.executable, "-m", "kbtd", "-f", str(self.board), "owner", "1", "1", "1", value],
+                       check=True, stdout=subprocess.DEVNULL)
+
+    def queue_assignment(self, command):
+        self.board.write_text("# Tasks\n## Backlog\n- [ ] Work\n")
+        self.watchers.add("assign", '"codex" in owner.added and task.status == "Backlog"', command)
+        self.set_owner("codex")
+
+    def assert_one_launch(self, job):
+        with closing(sqlite3.connect(self.board.parent / "launcher.db")) as db:
+            runs = list(db.execute("SELECT board, job, event FROM runs"))
+        self.assertEqual([(board, job_id, json.loads(event)) for board, job_id, event in runs],
+                         [(str(self.board), str(job["id"]), job["event"])])
+        self.assertEqual([entry["id"] for entry in self.watchers.jobs()], [job["id"]])
+
     def test_failure_and_explicit_retry_after_removal(self):
-        command = self.command("import pathlib, sys\nsys.exit(0 if pathlib.Path('ready').exists() else 9)")
-        self.watchers.add("done", "task.completed", command)
-        self.watchers.emit("task.completed", {"path": "1.1"})
+        command = self.command("import pathlib\nif not pathlib.Path('ready').exists(): raise SystemExit(9)\n"
+                               + RECORD_LAUNCH)
+        self.queue_assignment(command)
         job = self.wait_for_job("failed")
         self.assertEqual((job["attempt"], job["detail"], job["exit_code"]), (1, "exit code 9", 9))
-        self.watchers.remove("done")
+        self.assertFalse((self.board.parent / "launcher.db").exists())
+        self.watchers.remove("assign")
         (self.board.parent / "ready").touch()
         self.watchers.retry(job["id"])
         retry = self.wait_for_job("succeeded")
         self.assertEqual((retry["id"], retry["attempt"], retry["command"]), (job["id"], 2, command))
+        self.assertEqual(retry["event"], job["event"])
+        self.assert_one_launch(job)
         with self.assertRaisesRegex(ValueError, "only failed or interrupted"):
             self.watchers.retry(job["id"])
         with self.assertRaisesRegex(ValueError, "no watcher job numbered 99"):
@@ -270,18 +337,20 @@ class WatchersTests(unittest.TestCase):
     def test_stopped_worker_reruns_the_action_until_the_recovery_limit(self):
         starts = self.board.parent / "starts"
         command = self.command(
-            "import os, pathlib, time\n"
+            RECORD_LAUNCH
+            + "import pathlib, time\n"
             "with open('starts', 'a') as f: print(os.environ['KBTD_ATTEMPT'], file=f)\n"
             "if not pathlib.Path('ready').exists():\n"
             "    pathlib.Path('group').write_text(str(os.getpgid(0)))\n"
             "    time.sleep(60)\n"
         )
-        self.watchers.add("done", "task.completed", command)
-        self.watchers.emit("task.completed", {})
+        self.queue_assignment(command)
         for attempt in range(1, MAX_RECOVERIES + 2):
             # Stop the worker and its action together, as a reboot would.
             self.wait_for(lambda: starts.exists() and len(starts.read_text().split()) == attempt
                           and (self.board.parent / "group").exists(), f"start {attempt}")
+            if attempt == 1:
+                self.set_owner("--clear")  # Recovery must use the original assignment.
             os.killpg(int((self.board.parent / "group").read_text()), signal.SIGKILL)
             (self.board.parent / "group").unlink()
             self.wait_for(self.worker_stopped, "the worker to stop")
@@ -294,6 +363,8 @@ class WatchersTests(unittest.TestCase):
         self.watchers.retry(1)
         self.assertEqual(self.wait_for_job("succeeded")["attempt"], MAX_RECOVERIES + 2)
         self.assertEqual(starts.read_text().split(), [str(n) for n in range(1, MAX_RECOVERIES + 3)])
+        self.assertEqual(job["event"]["after"]["owners"], ["codex"])
+        self.assert_one_launch(job)
 
     def worker_stopped(self):
         if not self.watchers.path.parent.exists():
