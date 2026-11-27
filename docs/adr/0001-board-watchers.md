@@ -1,6 +1,6 @@
 # ADR 0001 — Board watchers and background shell actions
 
-Accepted for the local CLI and TUI. [ADR 0002](0002-dbos-watcher-runtime.md) replaces the *Execution and recovery* and *Runner options* sections: DBOS now runs actions, reruns interrupted ones and keeps their output.
+Accepted for the local CLI and TUI. [ADR 0003](0003-python-triggers.md) replaces the trigger syntax with Python expressions. [ADR 0002](0002-dbos-watcher-runtime.md) replaces the *Execution and recovery* and *Runner options* sections: DBOS now runs actions, reruns interrupted ones and keeps their output.
 
 ## Decision
 

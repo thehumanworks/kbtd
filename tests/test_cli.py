@@ -218,6 +218,25 @@ class CliTests(unittest.TestCase):
             self.assertIn("Board saved. Watcher dispatch failed", self.cli(*command, ok=False))
             self.assertIn("- [x] Intro", self.file.read_text())
 
+    def test_invalid_stored_trigger_is_reported_and_skipped(self):
+        self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
+        os.environ.pop("KBTD_JOB_ID", None)
+        self.enterContext(patch.object(Watchers, "_start_worker"))
+        path = str(self.file)
+        self.file.write_text("# Tasks\n## Work\n- [ ] Intro\n")
+        self.cli("-f", path, "watch", "add", "valid", "task.completed", "exit 0")
+        watchers = Watchers(self.file)
+        with watchers._database() as db:  # registered with the earlier TLA+-style syntax
+            db.execute("INSERT INTO kbtd_watchers VALUES ('legacy', 'task.completed /\\ task.done', 'exit 0')")
+        self.assertIn("Board saved. Skipped watcher 'legacy'", self.cli("-f", path, "toggle", "1", "1", "1", ok=False))
+        self.assertIn("- [x] Intro", self.file.read_text())
+        self.assertEqual([job["name"] for job in watchers.jobs()], ["valid"])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(main(["-f", path, "watch", "list"]), 0)
+        self.assertIn("legacy\ttask.completed /\\ task.done", out.getvalue())
+        self.assertIn("watcher 'legacy' never runs", err.getvalue())
+
     def test_conditional_watchers_match_once_per_saved_edit_on_the_selected_card(self):
         self.enterContext(patch.dict(os.environ, XDG_STATE_HOME=str(self.file.parent / "state")))
         os.environ.pop("KBTD_JOB_ID", None)
@@ -225,15 +244,15 @@ class CliTests(unittest.TestCase):
         path = str(self.file)
         self.file.write_text("# Tasks\n## Backlog\n- [ ] Parent\n  - [ ] Child\n## In Progress\n")
         watchers = Watchers(self.file)
-        together = r'owner.changed /\ tags.changed'
-        either = r'owner.changed = "codex" \/ tags.changed = "docs"'
-        assigned = r'owner.changed = "codex" /\ task.status = "Backlog"'
+        together = "owner.changed and tags.changed"
+        either = '(owner.changed and "codex" in task.owners) or (tags.changed and "docs" in task.tags)'
+        assigned = 'owner.changed and "codex" in task.owners and task.status == "Backlog"'
         for name, condition in [("both", together), ("either", either), ("assign", assigned),
                                 ("z-owner", "owner.changed"), ("a-tags", "tags.changed")]:
             self.cli("-f", path, "watch", "add", name, condition, "exit 0")
         self.assertIn(assigned, self.cli("-f", path, "watch", "list"))
-        self.assertIn("double-quoted", self.cli("-f", path, "watch", "add", "bad",
-                                                "task.status = Backlog", "exit 1", ok=False))
+        self.assertIn("compare with ==", self.cli("-f", path, "watch", "add", "bad",
+                                                  "task.status = Backlog", "exit 1", ok=False))
 
         # Neither different cards nor successive saves on a single card can
         # satisfy a conjunction of two events.

@@ -4,7 +4,9 @@ import argparse
 import json
 from pathlib import Path
 
-from .conditions import EVENT_FIELDS
+import sys
+
+from .conditions import EVENTS, FIELDS, compile_trigger
 from .watchers import Watchers
 
 
@@ -13,9 +15,10 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     add = commands.add_parser("add", parents=[common], help="register a shell command for this board file")
     add.add_argument("name", help="unique watcher name")
     add.add_argument("trigger", help=(
-        f"event ({', '.join(EVENT_FIELDS)}) or quoted condition, "
-        r'e.g. owner.changed = "codex" /\ task.status = "Backlog". '
-        r'Use /\ (and), \/ (or), ~ (not) and parentheses.'
+        f"event ({', '.join(EVENTS)}) or a quoted Python condition, "
+        "e.g. 'owner.changed and \"codex\" in task.owners and task.status == \"Backlog\"'. "
+        f"Names: {', '.join(name for name in FIELDS if name not in EVENTS)}; "
+        "operators: and, or, not, ==, !=, in, not in."
     ))
     add.add_argument("action", help="one quoted shell command, run in the board directory")
     commands.add_parser("list", parents=[common], help="list configured watchers")
@@ -45,6 +48,11 @@ def manage(path: Path, args: argparse.Namespace) -> None:
                 print("No watchers configured for this board.")
             for entry in entries:
                 print(f"{entry['name']}\t{entry['trigger']}\t{entry['command']}")
+                try:
+                    compile_trigger(entry["trigger"])
+                except ValueError as exc:
+                    print(f"kbtd: watcher {entry['name']!r} never runs: {exc}. "
+                          "Remove it and register it again.", file=sys.stderr)
         case "jobs":
             jobs = watchers.jobs()
             if not jobs:

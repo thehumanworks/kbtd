@@ -190,12 +190,27 @@ kbtd watch jobs
 To log assignments to Codex in Backlog, pass the whole condition as one shell argument.
 
 ```sh
-kbtd watch add codex-backlog 'owner.changed = "codex" /\ task.status = "Backlog"' 'printf "%s\n" "$KBTD_EVENT" >> codex.jsonl'
+kbtd watch add codex-backlog 'owner.changed and "codex" in task.owners and task.status == "Backlog"' 'printf "%s\n" "$KBTD_EVENT" >> codex.jsonl'
 ```
 
-An event name tests whether that change happened in this edit. `owner.changed = "codex"` also requires the resulting owners to include `codex`. `tags.changed = "docs"` works the same way for tags. Omit `@` and `#` in these values. Completion events accept `TRUE` or `FALSE` for the resulting checkbox. `task.status = "Backlog"` checks the exact column name. String comparisons are case-sensitive and use JSON double quotes.
+A condition is a Python expression. KBTD reads it with Python's own parser and evaluates only the names and operators below. It never runs the text as code.
 
-Combine predicates with `~` (not), `/\` (and) and `\/` (or), in that order of precedence. Parentheses group alternatives. For example, `(owner.changed \/ tags.changed) /\ task.status = "In Progress"` runs once for an edit in that column even if it changes both fields. Each edit is evaluated independently. Conditions run only on edits that emit at least one event in the table above.
+| Name | Type | Value |
+| --- | --- | --- |
+| `owner.changed`, `tags.changed`, `task.completed`, `task.reopened` | boolean | Whether this edit emitted that event |
+| `task.status` | string | Column name after the edit |
+| `task.section` | string | Board (H1) name |
+| `task.text` | string | Task-line text after the edit |
+| `task.done` | boolean | Checkbox after the edit |
+| `task.owners`, `task.tags` | list of strings | Owners and tags after the edit, sorted, without `@` and `#` |
+
+Combine conditions with `and`, `or`, `not` and parentheses. Compare with `==`, `!=`, `in` and `not in`. Values are quoted strings, `True`, `False`, or lists of strings such as `["Backlog", "Ready"]`. A list name on its own is true when the list is not empty, and `"bug" in task.text` tests for a substring. Comparisons are case-sensitive. Wrap a condition that spans several lines in parentheses.
+
+`kbtd watch add` rejects a condition that cannot do what it says: an unknown name (`task.owner`), a comparison of different types (`task.owners == "codex"`), or a fixed value used as a condition (`owner.changed and "codex"`). The error names the part to fix.
+
+For example, `(owner.changed or tags.changed) and task.status == "In Progress"` runs once for an edit in that column, even if the edit changes both fields. Each edit is evaluated independently. Conditions run only on edits that emit at least one event in the table above.
+
+Earlier versions used `/\`, `\/`, `~` and `=`. A watcher saved with that syntax no longer runs. `kbtd watch list` names it, and edits report that it was skipped. Remove it and register it again in the new syntax.
 
 For conditional watchers, `KBTD_TRIGGER` holds the registered expression and `KBTD_EVENT.events` in the JSON payload lists the event names from the edit.
 

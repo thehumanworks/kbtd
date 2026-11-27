@@ -1,6 +1,6 @@
 ---
 name: kbtd-watchers
-description: How kbtd's board watchers run on DBOS. Covers the outbox in kbtd/watchers.py, the detached worker and workflow in kbtd/watch_worker.py, job statuses, recovery, the tests, and how to inspect a board's job database. Use this skill whenever you change, debug or explain anything about `kbtd watch` commands, watcher triggers that enqueue jobs, KBTD_* action environment variables, job history or retries, the watcher SQLite file under $XDG_STATE_HOME/kbtd/watchers, or the plan to move watchers to Postgres or the cloud. Pair it with the dbos-python skill for DBOS API details.
+description: How kbtd's board watchers run on DBOS. Covers the outbox in kbtd/watchers.py, the detached worker and workflow in kbtd/watch_worker.py, job statuses, recovery, the tests, and how to inspect a board's job database. Use this skill whenever you change, debug or explain anything about `kbtd watch` commands, watcher trigger conditions (Python expressions in kbtd/conditions.py), KBTD_* action environment variables, job history or retries, the watcher SQLite file under $XDG_STATE_HOME/kbtd/watchers, or the plan to move watchers to Postgres or the cloud. Pair it with the dbos-python skill for DBOS API details.
 ---
 
 # kbtd watchers on DBOS
@@ -29,6 +29,14 @@ One SQLite file per board holds the DBOS tables plus `kbtd_watchers` and `kbtd_o
 5. **One step per side effect.** `watcher_action` has exactly one step, `kbtd.run_command`. Count real starts inside that step (the `attempt` attribute), not with `recovery_attempts`.
 6. **Version pinning.** `APP_VERSION` in `kbtd/watchers.py` must change when the steps of `watcher_action` change: renaming, adding, removing or reordering steps, or changing step inputs. A worker runs only its own version or unversioned jobs, so old `PENDING` jobs need a migration note.
 7. **Action contract.** ADR 0001 plus ADR 0002 define it. The command runs in the board's directory with `KBTD_BOARD`, `KBTD_TRIGGER`, `KBTD_JOB_ID`, `KBTD_EVENT` and `KBTD_ATTEMPT`. stdin is closed. stdout and stderr go to a temporary file whose last 8 KiB is kept. Nested kbtd edits are suppressed because `KBTD_JOB_ID` is set.
+
+## Triggers (`kbtd/conditions.py`, ADR 0003)
+
+A trigger is a Python expression. `ast.parse` reads it, and `_Compiler` turns an allow-listed, typed subset into `matcher(event_names, payload) -> bool`. Never `eval` trigger text. To add a name, add it to `FIELDS` with its type and reader, then document it in the README table, ADR 0003 and the `watch add` help. Keep these rules:
+
+- Every new node type needs a type check, so mistakes fail at `kbtd watch add`, not silently on each edit.
+- `emit_many` compiles each stored watcher separately. An invalid one raises `SkippedWatchers` after the valid jobs are committed, and `BoardFile.save` turns that into a "Board saved. Skipped watcher ..." warning.
+- `TriggerTests.test_matches_a_reference_evaluator_on_random_conditions` compares the compiler with a reference evaluator. Extend `random_condition` when you add a name or an operator.
 
 ## Status mapping (used by `watch jobs` and `watch show`)
 

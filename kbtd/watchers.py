@@ -59,6 +59,15 @@ _LOG_LIMIT = 1 << 20
 _NOT_RETRYABLE = "only failed, interrupted or cancelled watcher jobs can be retried"
 
 
+class SkippedWatchers(ValueError):
+    """Raised after dispatch when stored watchers have triggers that no longer compile."""
+
+    def __init__(self, names: list[str]):
+        self.names = names
+        listed = ", ".join(repr(name) for name in names)
+        super().__init__(f"Skipped watcher {listed}: invalid trigger. Run 'kbtd watch list' to see why.")
+
+
 class Watchers:
     def __init__(self, board_path: Path):
         self.board = board_path.expanduser().resolve()
@@ -156,13 +165,20 @@ class Watchers:
             return
         from .conditions import compile_trigger
 
-        count = 0
+        count, skipped = 0, []
         with self._database() as db:
             db.execute("BEGIN IMMEDIATE")
-            watchers = db.execute("SELECT * FROM kbtd_watchers ORDER BY name").fetchall()
+            watchers = []
+            for watcher in db.execute("SELECT * FROM kbtd_watchers ORDER BY name"):
+                # One bad definition (for example the earlier TLA+-style syntax)
+                # must not stop the other watchers from reacting.
+                try:
+                    watchers.append((watcher, compile_trigger(watcher["trigger"])))
+                except ValueError:
+                    skipped.append(watcher["name"])
             for transitions, payload in events:
                 kinds = (transitions,) if isinstance(transitions, str) else transitions
-                matches = [w for w in watchers if compile_trigger(w["trigger"])(kinds, payload)]
+                matches = [w for w, matcher in watchers if matcher(kinds, payload)]
                 # Keep the original event order, then watcher name, for bare triggers.
                 order = {kind: index for index, kind in enumerate(kinds)}
                 matches.sort(key=lambda w: order.get(w["trigger"], len(kinds)))
@@ -178,6 +194,8 @@ class Watchers:
                 count += len(matches)
         if count:
             self.wake()
+        if skipped:
+            raise SkippedWatchers(skipped)
 
     def emit(self, trigger: str, payload: dict) -> None:
         self.emit_many([(trigger, payload)])
