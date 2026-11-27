@@ -16,7 +16,7 @@ def add_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentPars
     add.add_argument("name", help="unique watcher name")
     add.add_argument("trigger", help=(
         f"event ({', '.join(EVENTS)}) or a quoted Python condition, "
-        "e.g. 'owner.changed and \"codex\" in task.owners and task.status == \"Backlog\"'. "
+        "e.g. '\"codex\" in owner.added and task.status == \"Backlog\"'. "
         f"Names: {', '.join(name for name in FIELDS if name not in EVENTS)}; "
         "operators: and, or, not, ==, !=, in, not in."
     ))

@@ -191,7 +191,7 @@ kbtd watch jobs
 To log assignments to Codex in Backlog, pass the whole condition as one shell argument.
 
 ```sh
-kbtd watch add codex-backlog 'owner.changed and "codex" in task.owners and task.status == "Backlog"' 'printf "%s\n" "$KBTD_EVENT" >> codex.jsonl'
+kbtd watch add codex-backlog '"codex" in owner.added and task.status == "Backlog"' 'printf "%s\n" "$KBTD_EVENT" >> codex.jsonl'
 ```
 
 A condition is a Python expression. KBTD reads it with Python's own parser and evaluates only the names and operators below. It never runs the text as code.
@@ -199,12 +199,15 @@ A condition is a Python expression. KBTD reads it with Python's own parser and e
 | Name | Type | Value |
 | --- | --- | --- |
 | `owner.changed`, `tags.changed`, `task.completed`, `task.reopened`, `task.status.changed` | boolean | Whether this edit emitted that event |
+| `owner.added`, `owner.removed` | list of strings | Owners who joined or left in this edit, sorted and unique, without `@` |
 | `task.status` | string | Column name after the edit |
 | `task.status.changed_from`, `task.status.changed_to` | string or `None` | Column before / after a move. `None` when the edit did not move the task. |
 | `task.section` | string | Board (H1) name |
 | `task.text` | string | Task-line text after the edit |
 | `task.done` | boolean | Checkbox after the edit |
 | `task.owners`, `task.tags` | list of strings | Owners and tags after the edit, sorted, without `@` and `#` |
+
+For a handoff from Sam to Codex, use `"sam" in owner.removed and "codex" in owner.added`. Adding Sam while Codex stays assigned matches `owner.changed and "codex" in task.owners`. Only adding Codex matches `"codex" in owner.added`.
 
 Combine conditions with `and`, `or`, `not` and parentheses. Compare with `==`, `!=`, `in` and `not in`. Values are quoted strings, `True`, `False`, or lists of strings such as `["Backlog", "Ready"]`. A list name on its own is true when the list is not empty, and `"bug" in task.text` tests for a substring. Comparisons are case-sensitive. Wrap a condition that spans several lines in parentheses.
 
@@ -232,7 +235,7 @@ Use `kbtd watch list` to see definitions and `kbtd watch remove NAME` to stop fu
 | `interrupted` | The worker stopped during each of three starts. KBTD stops rerunning it. |
 | `cancelled` | Someone cancelled the job before it started, with `kbtd watch cancel`, the TUI or the DBOS tools. |
 
-Actions run **at least once**. If the worker stops during an action, the next worker runs it again, up to three starts in total. Opening the TUI, listing jobs or an edit that matches a watcher starts that worker. `KBTD_ATTEMPT` tells the command which start this is. Use `KBTD_BOARD` and `KBTD_JOB_ID` together to deduplicate side effects.
+Actions run **at least once**. If the worker stops during an action, the next worker runs it again, up to three starts in total. Opening the TUI, listing jobs or an edit that matches a watcher starts that worker. `KBTD_ATTEMPT` tells the command which start this is. An agent launcher can use `KBTD_BOARD` and `KBTD_JOB_ID` together as an idempotency key to create or return the same agent run on every attempt. A later removal and re-assignment generates a new assignment job with its own key.
 
 `kbtd watch show ID` prints one job as JSON: its command, event, exit code and the last 8 KiB of the command's combined output. `kbtd watch retry ID` reruns a failed, interrupted or cancelled job with its original command and event. A retry can repeat a shell side effect. `kbtd watch cancel ID` takes a queued job off the queue. It cannot stop a command that has started, and a job the worker picks up at that moment may still run. Right after an edit, a job may take about a second to reach the worker; until then, cancel asks you to try again.
 

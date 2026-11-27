@@ -38,6 +38,7 @@ A trigger is a Python expression. `ast.parse` reads it, and `_Compiler` turns an
 - `emit_many` compiles each stored watcher separately. An invalid one raises `SkippedWatchers` after the valid jobs are committed, and `BoardFile.save` turns that into a "Board saved. Skipped watcher ..." warning.
 - Moves emit `task.status.changed` (`events.move_events`, called by the CLI `move` and the TUI `_move`). `task.status.changed_from` and `changed_to` are `None` without a move, so the compiler allows only `==` and `in` on them. The payload's column and path name the task's new place.
 - `TriggerTests.test_matches_a_reference_evaluator_on_random_conditions` compares the compiler with a reference evaluator. Extend `random_condition` when you add a name or an operator.
+- For an assignment use `"codex" in owner.added`. For a removal use `"codex" in owner.removed`. Both lists come from one edit's owner snapshots. Use `owner.changed and "codex" in task.owners` when edits that retain Codex should also match. Recovery runs the recorded job and an external launcher can deduplicate attempts with `(KBTD_BOARD, KBTD_JOB_ID)`.
 
 ## Status mapping (used by `watch jobs` and `watch show`)
 

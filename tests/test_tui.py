@@ -114,11 +114,13 @@ class TuiTests(unittest.TestCase):
     def test_conditional_watcher_follows_tui_edits_across_columns(self):
         os.environ.pop("KBTD_JOB_ID", None)  # setUp isolates the environment
         watchers = Watchers(self.source.path)
-        condition = 'owner.changed and "codex" in task.owners and tags.changed and task.status == "Queue"'
+        condition = '"codex" in owner.added and tags.changed and task.status == "Queue"'
         watchers.add("combined", condition, "exit 0")
         self.enterContext(patch.object(Watchers, "_start_worker"))
         self.ui.select(0)
         for key in "e @codex #docs\n":
+            self.ui.key(key)
+        for key in "e @sam #review\n":  # Both owner and tag sets change while Codex stays assigned.
             self.ui.key(key)
         self.ui.key("L")  # Repeat an edit that changes both fields in Doing.
         for title in ("first @sam #old", "first @codex #docs"):
